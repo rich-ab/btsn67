@@ -225,21 +225,25 @@ async def _search(queries: list[str]):
 
     for provider in SEARCH_PROVIDERS:
         try:
-            kwargs: dict[str, Any] = {}
             if provider == "parallel":
-                # "basic" is a good quality/cost baseline. It should be tested
-                # against your pinned batch before changing to turbo/advanced.
-                kwargs["provider_extra"] = {
-                    "mode": "basic",
-                    "max_chars_total": 18000,
-                }
+                # Keep Parallel-specific options explicit. Harnyx's submitted-script
+                # validator rejects expanded keyword arguments such as **kwargs.
+                return await search_web(
+                    queries,
+                    provider=provider,
+                    num=SEARCH_RESULTS_PER_QUERY,
+                    timeout=35.0,
+                    provider_extra={
+                        "mode": "basic",
+                        "max_chars_total": 18000,
+                    },
+                )
 
             return await search_web(
                 queries,
                 provider=provider,
                 num=SEARCH_RESULTS_PER_QUERY,
                 timeout=35.0,
-                **kwargs,
             )
         except Exception as exc:
             last_error = exc
