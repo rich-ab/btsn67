@@ -1,4 +1,4 @@
-"""Harnyx SN67 miner — 151 Richjg.
+"""Harnyx SN67 miner — 151 (Richjg).
 
 This candidate is built around a bounded evidence-compiler rather than a long
 conversational tool loop.  It is designed from a real local-eval failure where
@@ -21,6 +21,8 @@ Design goals:
 - enforce hard source locking for prompts that say using only/solely/from the official named source;
 - refuse to finalize a multipart answer until every required part has grounded evidence;
 - resolve same-slot factual contradictions before any answer can leave the controller;
+- bind evidence to the requested event/discipline/sex and reject neighboring-event pages;
+- pin canonical event-specific result routes before generic competition/calendar pages;
 - prefer section-scoped table counts over whole-page row aggregates;
 - explain discrepancy/counterfactual questions when the evidence supports why;
 - keep exact receipt-backed citation slices around decisive quotes;
@@ -43,7 +45,7 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "conflictsafe-v11.0"
+VERSION = "canonical-event-v12.0"
 
 # ---------------------------------------------------------------------------
 # Runtime policy
@@ -371,7 +373,219 @@ def _event_identity_score(question: str, url: str, title: str, body: str = "") -
         score += 7
     if "final" in q and "final" in hay:
         score += 7
+
+    # V11 failure mode: a generic official competition page contained the
+    # requested discipline in its navigation menu while the active table was a
+    # completely different event. Canonical routes and active headings now
+    # dominate generic authority/text overlap.
+    score += _canonical_result_route_score(question, url)
+    state = _event_match_state(question, url, title, body)
+    if state == 2:
+        score += 90
+    elif state == 1:
+        score += 45
+    elif state < 0:
+        score -= 180
     return score
+
+
+
+def _event_signature(value: str) -> dict[str, str]:
+    """Extract a compact event identity from a question, URL-ish text, or heading.
+
+    The goal is not to understand every sport.  It is to recognize enough
+    explicit identity to veto a clearly different neighboring event on the same
+    official competition page.  Unknown is safer than a false mismatch.
+    """
+    raw = _clean_space(value)
+    low = raw.lower().replace("×", "x")
+    sex = ""
+    if re.search(r"\bmen(?:'s)?\b", low) and not re.search(r"\bwomen(?:'s)?\b", low):
+        sex = "men"
+    elif re.search(r"\bwomen(?:'s)?\b", low):
+        sex = "women"
+
+    discipline = ""
+    # Relays must be detected before the single-distance expression.
+    relay = re.search(r"\b(4)\s*[x×]\s*(\d{2,4})\s*(?:m|metres|meters)?\b", low)
+    if relay:
+        discipline = f"{relay.group(1)}x{relay.group(2)}-metres-relay"
+    else:
+        distance = re.search(r"\b(\d{2,5})\s*(?:m|metres|meters)\b", low)
+        if distance:
+            discipline = f"{distance.group(1)}-metres"
+
+    named = (
+        ("3000-metres-steeplechase", ("3000 metres steeplechase", "3000m steeplechase")),
+        ("110-metres-hurdles", ("110 metres hurdles", "110m hurdles")),
+        ("100-metres-hurdles", ("100 metres hurdles", "100m hurdles")),
+        ("400-metres-hurdles", ("400 metres hurdles", "400m hurdles")),
+        ("high-jump", ("high jump",)),
+        ("long-jump", ("long jump",)),
+        ("triple-jump", ("triple jump",)),
+        ("pole-vault", ("pole vault",)),
+        ("shot-put", ("shot put",)),
+        ("discus-throw", ("discus throw",)),
+        ("hammer-throw", ("hammer throw",)),
+        ("javelin-throw", ("javelin throw",)),
+        ("decathlon", ("decathlon",)),
+        ("heptathlon", ("heptathlon",)),
+        ("marathon", ("marathon",)),
+    )
+    # Named disciplines are more specific than a stray number elsewhere.
+    for slug, aliases in named:
+        if any(alias in low for alias in aliases):
+            discipline = slug
+            break
+
+    return {"sex": sex, "discipline": discipline}
+
+
+def _expected_event_signature(question: str) -> dict[str, str]:
+    return _event_signature(question)
+
+
+def _heading_candidate(line: str) -> str:
+    raw = _clean_space(line)
+    if not raw:
+        return ""
+    # Strip markdown/list formatting but keep apostrophes and event punctuation.
+    raw = re.sub(r"^[#>*_\-\s]+", "", raw).strip()
+    raw = re.sub(r"\s+", " ", raw)
+    if not raw or len(raw) > 125:
+        return ""
+    return raw
+
+
+def _active_event_heading(body: str) -> str:
+    """Return the first visible heading that looks like an actual event.
+
+    Navigation menus often contain every discipline on one very long line.  We
+    intentionally ignore long/menu-like lines and favor short headings such as
+    `Men's 1500 Metres` or `Men's 4x400 Metres Relay`.
+    """
+    if not body:
+        return ""
+    for raw in body.splitlines()[:260]:
+        candidate = _heading_candidate(raw)
+        if not candidate:
+            continue
+        sig = _event_signature(candidate)
+        if not sig.get("discipline"):
+            continue
+        low = candidate.lower()
+        # Exclude generic menu/index strings that happen to enumerate events.
+        if low.count("metres") + low.count("meters") > 2:
+            continue
+        if len(candidate.split()) > 12:
+            continue
+        return candidate
+    return ""
+
+
+def _event_match_state(question: str, url: str, title: str, body: str = "") -> int:
+    """Return 2 strong match, 1 visible match, 0 unknown, -1 explicit mismatch."""
+    expected = _expected_event_signature(question)
+    if not expected.get("discipline") and not expected.get("sex"):
+        return 0
+
+    path_text = urlparse(url or "").path.lower().replace("_", "-")
+    path_text = path_text.replace("%20", "-")
+    expected_disc = expected.get("discipline", "")
+    expected_sex = expected.get("sex", "")
+
+    # Canonical event routes are strongest evidence of identity.
+    route_disc_match = bool(expected_disc and expected_disc in path_text)
+    route_sex_match = bool(expected_sex and f"/{expected_sex}/" in path_text)
+    if route_disc_match and (not expected_sex or route_sex_match):
+        return 2
+
+    heading = _active_event_heading(body)
+    if heading:
+        actual = _event_signature(heading)
+        actual_disc = actual.get("discipline", "")
+        actual_sex = actual.get("sex", "")
+        if expected_disc and actual_disc and expected_disc != actual_disc:
+            return -1
+        if expected_sex and actual_sex and expected_sex != actual_sex:
+            return -1
+        if expected_disc and actual_disc == expected_disc:
+            return 1
+        if expected_sex and actual_sex == expected_sex and not expected_disc:
+            return 1
+
+    # Titles can confirm identity but should not veto a page because many
+    # official result titles are generic.
+    title_sig = _event_signature(title or "")
+    if expected_disc and title_sig.get("discipline") == expected_disc:
+        if not expected_sex or not title_sig.get("sex") or title_sig.get("sex") == expected_sex:
+            return 1
+    return 0
+
+
+def _canonical_result_route_score(question: str, url: str) -> int:
+    """Reward event-specific result routes and penalize clearly different routes."""
+    expected = _expected_event_signature(question)
+    discipline = expected.get("discipline", "")
+    sex = expected.get("sex", "")
+    path = urlparse(url or "").path.lower().replace("_", "-")
+    score = 0
+    if "/results/" in path:
+        score += 10
+    if discipline:
+        if discipline in path:
+            score += 90
+        else:
+            # If the path explicitly names another recognized event under a
+            # result route, it is a strong mismatch. Generic calendar pages stay
+            # neutral and can still be validated by their active heading.
+            path_sig = _event_signature(path.replace("-", " "))
+            other = path_sig.get("discipline", "")
+            if other and other != discipline:
+                score -= 100
+    if sex:
+        if f"/{sex}/" in path:
+            score += 35
+        elif re.search(r"/(?:men|women)/", path):
+            score -= 70
+    if "/semi-final/result" in path or "/semifinal/result" in path:
+        score += 35
+    if "/final/result" in path:
+        score += 35
+    return score
+
+
+def _canonical_event_source(question: str, row: dict[str, Any]) -> bool:
+    state = _event_match_state(
+        question,
+        str(row.get("url") or ""),
+        str(row.get("title") or ""),
+        str(row.get("text") or "")[:5000],
+    )
+    return state >= 1 or _canonical_result_route_score(question, str(row.get("url") or "")) >= 100
+
+
+def _event_source_rejected(question: str, row: dict[str, Any]) -> bool:
+    return _event_match_state(
+        question,
+        str(row.get("url") or ""),
+        str(row.get("title") or ""),
+        str(row.get("text") or "")[:8000],
+    ) < 0
+
+
+def _canonical_stage_urls(url: str, question: str) -> list[str]:
+    """Return the event-specific URL and obvious sibling stage URLs."""
+    target = (url or "").strip()
+    if not target:
+        return []
+    if _canonical_result_route_score(question, target) < 100:
+        return []
+    out = [target]
+    for sibling in _stage_sibling_urls(target, question):
+        if sibling not in out:
+            out.append(sibling)
+    return out
 
 
 def _best_windows(text: str, focus: str, width: int = FETCH_WINDOW, count: int = FETCH_WINDOW_COUNT) -> list[tuple[int, int]]:
@@ -813,6 +1027,7 @@ class SourceBook:
         self.searched: list[str] = []
         self.fetched: list[str] = []
         self.locked_hosts: list[str] = []
+        self.pinned_event_urls: list[str] = []
 
     def _host_allowed(self, host: str) -> bool:
         if not self.qmap.hard_source_lock:
@@ -833,7 +1048,25 @@ class SourceBook:
 
     def source_allowed(self, number: int) -> bool:
         row = self.row(number)
-        return bool(row is not None and self._host_allowed(str(row.get("host") or "")))
+        if row is None or not self._host_allowed(str(row.get("host") or "")):
+            return False
+        if _event_source_rejected(self.qmap.question, row):
+            return False
+        # Once an exact event-specific route has been discovered, generic
+        # competition pages with unknown active-event identity are no longer
+        # admissible evidence. This prevents navigation/menu text from leaking
+        # a neighboring discipline back into synthesis or citations.
+        if self.has_canonical_event_source():
+            route = _canonical_result_route_score(self.qmap.question, str(row.get("url") or ""))
+            state = _event_match_state(
+                self.qmap.question,
+                str(row.get("url") or ""),
+                str(row.get("title") or ""),
+                str(row.get("text") or "")[:8000],
+            )
+            if route < 100 and state <= 0:
+                return False
+        return True
 
     def infer_source_lock(self) -> None:
         """Infer the named source's own host from discovery results."""
@@ -872,6 +1105,37 @@ class SourceBook:
             if host not in hosts:
                 hosts.append(host)
         self.locked_hosts = hosts[:3]
+        self.refresh_event_pins()
+
+    def refresh_event_pins(self) -> None:
+        """Pin canonical event-specific result routes discovered in search/fetch."""
+        candidates: list[tuple[int, str]] = []
+        for row in self.rows:
+            if _event_source_rejected(self.qmap.question, row):
+                continue
+            url = str(row.get("url") or "").strip()
+            route = _canonical_result_route_score(self.qmap.question, url)
+            if route < 100:
+                continue
+            candidates.append((route + _int(row.get("authority"), 0), url))
+            for sibling in _stage_sibling_urls(url, self.qmap.question):
+                candidates.append((route + 5, sibling))
+        candidates.sort(reverse=True)
+        pins: list[str] = []
+        for _, url in candidates:
+            clean = url.split("#", 1)[0]
+            if clean and clean not in pins:
+                pins.append(clean)
+        self.pinned_event_urls = pins[:6]
+
+    def has_canonical_event_source(self) -> bool:
+        if self.pinned_event_urls:
+            return True
+        return any(
+            _canonical_event_source(self.qmap.question, row)
+            for row in self.rows
+            if not _event_source_rejected(self.qmap.question, row)
+        )
 
     def row(self, number: int) -> dict[str, Any] | None:
         if 1 <= number <= len(self.rows):
@@ -914,6 +1178,9 @@ class SourceBook:
             "origin": origin,
         }
         self.rows.append(row)
+        # Search snippets can reveal an exact event route before any page fetch.
+        if _canonical_result_route_score(self.qmap.question, url) >= 100:
+            self.refresh_event_pins()
         return len(self.rows)
 
     def retain(self, number: int, quote: str) -> bool:
@@ -1001,6 +1268,8 @@ class SourceBook:
                 f"TITLE: {row.get('title','')}\n"
                 f"URL: {row.get('url','')}\n"
                 f"AUTHORITY: {row.get('authority',0)} ORIGIN: {row.get('origin','')}\n"
+                f"EVENT_MATCH: {_event_match_state(self.qmap.question, str(row.get('url') or ''), str(row.get('title') or ''), str(row.get('text') or '')[:5000])} "
+                f"CANONICAL_ROUTE_SCORE: {_canonical_result_route_score(self.qmap.question, str(row.get('url') or ''))}\n"
                 f"TEXT:\n{snippet}\n"
             )
             if spent + len(block) > max_chars:
@@ -1264,10 +1533,28 @@ def _named_source_host_score(book: SourceBook, row: dict[str, Any]) -> int:
 
 
 def _fetch_candidates(book: SourceBook, cap: int) -> list[str]:
-    ranked: list[tuple[int, int, int, int, str]] = []
+    """Choose event-correct pages, pinning canonical stage routes first."""
+    book.refresh_event_pins()
+    out: list[str] = []
+    seen: set[str] = set()
+
+    # Hard priority: canonical event-specific routes discovered by Parallel.
+    # This prevents generic competition/calendar pages from consuming the fetch
+    # budget when an exact /men/1500-metres/... route is already available.
+    for url in book.pinned_event_urls:
+        for candidate in _canonical_stage_urls(url, book.qmap.question) or [url]:
+            key = candidate.split("#", 1)[0]
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            out.append(candidate)
+            if len(out) >= cap:
+                return out
+
+    ranked: list[tuple[int, int, int, int, int, str]] = []
     for number in book.ranked():
         row = book.row(number)
-        if row is None:
+        if row is None or _event_source_rejected(book.qmap.question, row):
             continue
         url = str(row.get("url") or "").strip()
         if not url:
@@ -1276,39 +1563,30 @@ def _fetch_candidates(book: SourceBook, cap: int) -> list[str]:
             book.qmap.question,
             url,
             str(row.get("title") or ""),
-            str(row.get("text") or "")[:2200],
+            str(row.get("text") or "")[:4000],
         )
+        route = _canonical_result_route_score(book.qmap.question, url)
         owner = _named_source_host_score(book, row)
         score = book.relevance(number)
-        # Strong mismatch evidence should disqualify an otherwise authoritative page.
-        if identity <= -40:
+        if identity <= -40 or route <= -80:
             continue
-        ranked.append((-owner, -identity, -score, number, url))
+        # canonical route > active event match > source ownership > relevance.
+        state = _event_match_state(
+            book.qmap.question,
+            url,
+            str(row.get("title") or ""),
+            str(row.get("text") or "")[:5000],
+        )
+        ranked.append((-route, -state, -owner, -identity, -score, url))
     ranked.sort()
 
-    out: list[str] = []
-    seen: set[str] = set()
-
-    # First preserve high-identity primary result pages and derive their sibling
-    # stage URLs before secondary commentary pages consume the fetch budget.
-    for _, neg_identity, _, _, url in ranked:
-        identity = -neg_identity
-        if identity < 18:
-            continue
-        for candidate in [url] + _stage_sibling_urls(url, book.qmap.question):
+    for _, _, _, _, _, url in ranked:
+        candidates = _canonical_stage_urls(url, book.qmap.question)
+        if not candidates:
+            candidates = [url] + _stage_sibling_urls(url, book.qmap.question)
+        for candidate in candidates:
             key = candidate.split("#", 1)[0]
-            if key in seen:
-                continue
-            seen.add(key)
-            out.append(candidate)
-            if len(out) >= cap:
-                return out
-
-    # Fill remaining slots by combined identity/relevance.
-    for _, _, _, _, url in ranked:
-        for candidate in [url] + _stage_sibling_urls(url, book.qmap.question):
-            key = candidate.split("#", 1)[0]
-            if key in seen:
+            if not key or key in seen:
                 continue
             seen.add(key)
             out.append(candidate)
@@ -1364,6 +1642,20 @@ async def _fetch_one(url: str, book: SourceBook) -> int:
         return 0
     title = str(getattr(item, "title", None) or target)
     final_url = str(getattr(item, "url", None) or target)
+
+    probe = {
+        "url": final_url,
+        "title": title,
+        "text": note,
+        "host": _host(final_url),
+    }
+    # A same-domain page with an explicit different active event is never
+    # admissible evidence. Example: a Tokyo-2025 competition page whose active
+    # table is Men's 4x400 Relay cannot answer a Men's 1500m question merely
+    # because "Men's 1500 Metres" appears in the navigation menu.
+    if _event_source_rejected(book.qmap.question, probe):
+        return 0
+
     shown: list[tuple[int, int]] = []
     if len(note) <= 8500:
         shown = [(0, len(note))]
@@ -1565,10 +1857,24 @@ def _record_specificity(item: dict[str, Any], qmap: QuestionMap, book: SourceBoo
         score += 100
     if item.get("contiguous"):
         score += 60
+    route = _canonical_result_route_score(qmap.question, url)
+    state = _event_match_state(
+        qmap.question,
+        url,
+        str(row.get("title") or ""),
+        str(row.get("text") or "")[:8000],
+    )
+    score += max(-120, min(150, route))
+    if state == 2:
+        score += 100
+    elif state == 1:
+        score += 55
+    elif state < 0:
+        score -= 250
     if "/final/result" in url and role == "final":
-        score += 80
+        score += 120
     if "/semi-final/result" in url and role.startswith("semifinal"):
-        score += 70
+        score += 100
     if book.source_allowed(source):
         score += 50
     score += min(40, max(0, _int(row.get("authority"), 0)))
@@ -1596,10 +1902,23 @@ def _best_table_record(qmap: QuestionMap, book: SourceBook, role: str) -> dict[s
 
 def _table_signal_records(qmap: QuestionMap, book: SourceBook) -> list[dict[str, Any]]:
     signals: list[dict[str, Any]] = []
-    for number in book.ranked()[:12]:
+    canonical_exists = book.has_canonical_event_source()
+    for number in book.ranked()[:16]:
         row = book.row(number)
-        if row is None:
+        if row is None or _event_source_rejected(qmap.question, row):
             continue
+        if canonical_exists:
+            route = _canonical_result_route_score(qmap.question, str(row.get("url") or ""))
+            state = _event_match_state(
+                qmap.question,
+                str(row.get("url") or ""),
+                str(row.get("title") or ""),
+                str(row.get("text") or "")[:8000],
+            )
+            # Once event-specific routes exist, generic unknown event pages must
+            # not contribute deterministic row counts.
+            if route < 100 and state <= 0:
+                continue
         signals.extend(_table_records_for_row(number, row))
     return signals
 
