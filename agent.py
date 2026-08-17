@@ -1,4 +1,4 @@
-"""Harnyx SN67 miner — ParallelProof v9.
+"""Harnyx SN67 miner — SourceLock CoverageCompiler v10.
 
 This candidate is built around a bounded evidence-compiler rather than a long
 conversational tool loop.  It is designed from a real local-eval failure where
@@ -7,17 +7,19 @@ answer because it preserved source labels more faithfully, explained a subtle
 count discrepancy, and finished more cleanly.
 
 Controller topology:
-    question -> deterministic contract map -> deterministic retrieval plan
-             -> Parallel-primary search -> selective primary-page fetch
-             -> proof-grid extraction -> quote-verification firewall
-             -> verified-fact answer -> grounded answer compiler
-             -> deterministic numeric/entity hallucination guard
+    question -> deterministic contract + source policy -> Parallel-primary discovery
+             -> hard source-host lock when the prompt requires a named source
+             -> official-page fetch + sibling-stage derivation -> proof grid
+             -> mandatory per-subquestion coverage compiler -> quote verification
+             -> grounded answer selection -> deterministic hallucination guard
              -> source-verbatim restoration -> schema adapter
 
 Design goals:
 - reserve final-answer time instead of researching until the wall clock expires;
 - preserve exact names, marks, capitalization, units, dates and labels from source;
 - answer every numbered/multipart sub-question in order;
+- enforce hard source locking for prompts that say using only/solely/from the official named source;
+- refuse to finalize a multipart answer until every required part has grounded evidence;
 - explain discrepancy/counterfactual questions when the evidence supports why;
 - keep exact receipt-backed citation slices around decisive quotes;
 - never return the user's question as a fallback answer;
@@ -559,6 +561,7 @@ class QuestionMap:
         self.parts: list[str] = []
         self.named_sources: list[str] = []
         self.entities: list[str] = []
+        self.hard_source_lock = False
         self.must_preserve_exact = False
         self.explain_difference = False
         self.complete_set = False
@@ -572,6 +575,12 @@ class QuestionMap:
     def _derive(self) -> None:
         q = self.question
         low = q.lower()
+        if re.search(
+            r"\b(?:using|use|based on|from)\s+(?:only|solely|exclusively)\s+(?:the\s+)?(?:official\s+)?|"
+            r"\busing\s+only\s+the\s+official\b|\bonly\s+the\s+official\b",
+            low,
+        ):
+            self.hard_source_lock = True
         if re.search(r"exactly as (?:given|shown|printed|written)|verbatim|exact labels?|exact names?|exact marks?", low):
             self.must_preserve_exact = True
         if re.search(r"how .*compare|compare(?:s|d)? with|difference|why .*more|why .*less|discrep", low):
@@ -636,6 +645,7 @@ class QuestionMap:
                 "answer_kind": self.answer_kind,
                 "parts": self.parts,
                 "named_sources": self.named_sources,
+                "hard_source_lock": self.hard_source_lock,
                 "entities": self.entities,
                 "must_preserve_exact": self.must_preserve_exact,
                 "explain_difference": self.explain_difference,
@@ -800,6 +810,66 @@ class SourceBook:
         self.rows: list[dict[str, Any]] = []
         self.searched: list[str] = []
         self.fetched: list[str] = []
+        self.locked_hosts: list[str] = []
+
+    def _host_allowed(self, host: str) -> bool:
+        if not self.qmap.hard_source_lock:
+            return True
+        clean = (host or "").lower().split(":", 1)[0].strip(".")
+        if not self.locked_hosts:
+            host_flat = re.sub(r"[^a-z0-9]", "", clean)
+            for hint in self.qmap.named_sources:
+                h = re.sub(r"[^a-z0-9]", "", hint.lower())
+                if h and h in host_flat:
+                    return True
+            return not self.qmap.named_sources
+        for allowed in self.locked_hosts:
+            base = allowed.lower().split(":", 1)[0].strip(".")
+            if clean == base or clean.endswith("." + base) or base.endswith("." + clean):
+                return True
+        return False
+
+    def source_allowed(self, number: int) -> bool:
+        row = self.row(number)
+        return bool(row is not None and self._host_allowed(str(row.get("host") or "")))
+
+    def infer_source_lock(self) -> None:
+        """Infer the named source's own host from discovery results."""
+        if not self.qmap.hard_source_lock or not self.qmap.named_sources:
+            return
+        candidates: list[tuple[int, str]] = []
+        for row in self.rows:
+            host = str(row.get("host") or "").lower()
+            if not host:
+                continue
+            host_flat = re.sub(r"[^a-z0-9]", "", host)
+            owner = 0
+            for hint in self.qmap.named_sources:
+                h = re.sub(r"[^a-z0-9]", "", hint.lower())
+                if h and h in host_flat:
+                    owner += 100
+            if owner <= 0:
+                continue
+            identity = _event_identity_score(
+                self.qmap.question,
+                str(row.get("url") or ""),
+                str(row.get("title") or ""),
+                str(row.get("text") or "")[:2600],
+            )
+            if identity <= -20:
+                continue
+            candidates.append((owner + identity + _int(row.get("authority"), 0), host))
+        candidates.sort(reverse=True)
+        if not candidates:
+            return
+        best = candidates[0][0]
+        hosts: list[str] = []
+        for score, host in candidates:
+            if score < best - 18:
+                continue
+            if host not in hosts:
+                hosts.append(host)
+        self.locked_hosts = hosts[:3]
 
     def row(self, number: int) -> dict[str, Any] | None:
         if 1 <= number <= len(self.rows):
@@ -889,7 +959,7 @@ class SourceBook:
         return score
 
     def ranked(self) -> list[int]:
-        numbers = list(range(1, len(self.rows) + 1))
+        numbers = [n for n in range(1, len(self.rows) + 1) if self.source_allowed(n)]
         numbers.sort(key=lambda n: (-self.relevance(n), n))
         return numbers
 
@@ -941,7 +1011,7 @@ class SourceBook:
 
     def citation(self, number: int) -> tuple[CitationRef | None, int]:
         row = self.row(number)
-        if row is None:
+        if row is None or not self.source_allowed(number):
             return None, 0
         receipt = str(row.get("receipt_id") or "")
         result = str(row.get("result_id") or "")
@@ -1056,7 +1126,41 @@ async def _parallel_search_call(
     for q in clean:
         if q not in book.searched:
             book.searched.append(q)
-    return _ingest_search(payload, book)
+    added = _ingest_search(payload, book)
+    book.infer_source_lock()
+    return added
+
+
+async def _parallel_locked_repair(
+    queries: list[str],
+    book: SourceBook,
+    deadline: float,
+) -> list[int]:
+    """Run one domain-filtered Parallel search after a hard source host is known."""
+    if not book.qmap.hard_source_lock or not book.locked_hosts or _left(deadline) < 10.0:
+        return []
+    clean = [_clean_space(x) for x in queries if _clean_space(x)][:2]
+    if not clean:
+        return []
+    timeout = min(SEARCH_TIMEOUT, max(8.0, _left(deadline) - 5.0))
+    try:
+        payload = await search_web(
+            clean,
+            provider="parallel",
+            num=SEARCH_RESULTS,
+            timeout=timeout,
+            provider_extra={
+                "mode": "basic",
+                "max_chars_total": 24000,
+                "source_policy": {"include_domains": list(book.locked_hosts)},
+                "excerpt_settings": {"max_chars_per_result": 4200},
+            },
+        )
+    except Exception:
+        return []
+    added = _ingest_search(payload, book)
+    book.infer_source_lock()
+    return added
 
 
 async def _desearch_last_resort(query: str, book: SourceBook, deadline: float) -> list[int]:
@@ -1098,6 +1202,11 @@ async def _search_many(queries: list[str], book: SourceBook, deadline: float) ->
 
     collected = await _parallel_search_call(unique, book, deadline, False)
     if collected:
+        if book.qmap.hard_source_lock and book.locked_hosts and _left(deadline) > 24.0:
+            locked = await _parallel_locked_repair(unique, book, deadline)
+            for number in locked:
+                if number not in collected:
+                    collected.append(number)
         strongest = max(
             (_int((book.row(number) or {}).get("authority"), 0) for number in collected),
             default=0,
@@ -1652,7 +1761,25 @@ def _critical_names(text: str) -> list[str]:
 def _token_present(token: str, basis: str) -> bool:
     if not token:
         return True
-    return token.lower() in (basis or "").lower()
+    low_basis = (basis or "").lower()
+    if token.lower() in low_basis:
+        return True
+    # Preserve the existing policy that values explicitly stated by the user may
+    # appear in comparisons, while recognizing digit/word equivalents. This is
+    # important for prompts that contrast an asserted "twelve" with an actual 14.
+    number_words = {
+        0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
+        6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
+        11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen",
+        15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen",
+        19: "nineteen", 20: "twenty",
+    }
+    if re.fullmatch(r"\d{1,2}", token):
+        value = _int(token, -1)
+        word = number_words.get(value)
+        if word and re.search(rf"\b{re.escape(word)}\b", low_basis):
+            return True
+    return False
 
 
 def _coverage_signature(facts: list[dict[str, Any]]) -> list[str]:
@@ -1770,6 +1897,134 @@ def _grid_for_writer(grid: dict[str, Any], facts: list[dict[str, Any]]) -> dict[
     # atomic facts instead of being anchored to a possibly hallucinated draft.
     clean["draft_answer"] = ""
     return clean
+
+
+# ---------------------------------------------------------------------------
+# Mandatory multipart coverage compiler
+# ---------------------------------------------------------------------------
+
+
+def _required_part_count(qmap: QuestionMap) -> int:
+    return len(qmap.parts) if qmap.parts else 0
+
+
+def _source_markers(text: str) -> list[int]:
+    out: list[int] = []
+    for raw in re.findall(r"\[(\d{1,3})\]", text or ""):
+        value = _int(raw, 0)
+        if value > 0 and value not in out:
+            out.append(value)
+    return out
+
+
+def _part_object_valid(item: dict[str, Any], index: int, book: SourceBook, question: str) -> bool:
+    if _int(item.get("index"), 0) != index:
+        return False
+    answer = _clean_answer(str(item.get("answer") or ""))
+    if not _usable_answer(answer, question):
+        return False
+    sources = item.get("sources")
+    if not isinstance(sources, list) or not sources:
+        return False
+    valid_source = False
+    for raw in sources[:6]:
+        number = _int(raw, 0)
+        if number > 0 and book.source_allowed(number):
+            valid_source = True
+            break
+    if not valid_source or not _grounded_in_book(answer, question, book):
+        return False
+    quotes = item.get("quotes")
+    valid_quote = False
+    if isinstance(quotes, list):
+        for q in quotes[:6]:
+            if not isinstance(q, dict):
+                continue
+            number = _int(q.get("source"), 0)
+            quote = str(q.get("quote") or "").strip()
+            row = book.row(number)
+            if row is None or not book.source_allowed(number) or len(quote) < 6:
+                continue
+            if _quote_in_body(quote, str(row.get("text") or "")):
+                book.retain(number, quote)
+                valid_quote = True
+    return valid_quote
+
+
+async def _compile_required_parts(
+    qmap: QuestionMap,
+    plan: ResearchPlan,
+    book: SourceBook,
+    deadline: float,
+) -> str:
+    """Compile one independently grounded answer for every explicit part."""
+    count = _required_part_count(qmap)
+    if count <= 0 or not book.rows or _left(deadline) < 12.0:
+        return ""
+    evidence = book.pack(min(MAX_PACK_CHARS, 62000))
+    if not evidence:
+        return ""
+    parts_block = "\n".join(f"({i}) {part}" for i, part in enumerate(qmap.parts, 1))
+    lock_text = ", ".join(book.locked_hosts) if book.locked_hosts else "none"
+    system = (
+        "You are a CLOSED-BOOK multipart evidence compiler. Use ONLY the supplied numbered evidence. "
+        "The user's assertions are not evidence. Produce exactly one answer object for EVERY requested part; "
+        "never merge or omit parts. Every precise name, number, time, rank, date, unit, label and status must "
+        "appear in the supplied evidence. For a count, count the actual listed rows rather than inferring from "
+        "a qualification rule. For a comparison, state both actual result and rule-implied result, and explain "
+        "the difference only when the evidence shows it. For 'among these/best' tasks, establish the requested "
+        "pool before selecting the best member. Preserve source capitalization and marks exactly. "
+        "Each part must cite at least one source number and include at least one exact supporting quote."
+    )
+    user = (
+        f"QUESTION:\n{qmap.question}\n\nREQUIRED PARTS ({count}):\n{parts_block}\n\n"
+        f"HARD SOURCE LOCK: {qmap.hard_source_lock}\nALLOWED HOSTS: {lock_text}\n\nEVIDENCE:\n{evidence}\n\n"
+        "Return exactly valid JSON with this shape:\n"
+        '{"parts":[{"index":1,"answer":"complete direct answer to part 1 with [n] marker(s)",'
+        '"sources":[1],"quotes":[{"source":1,"quote":"exact supporting source text"}]}],'
+        '"all_parts_supported":true}\n\n'
+        f"The parts array MUST contain indices 1 through {count} exactly once. If a part truly cannot be supported, "
+        "return its answer as an empty string and all_parts_supported=false. Do not guess."
+    )
+    payload = await _chat(
+        GRID_MODELS,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        deadline,
+        6200,
+        min(GRID_TIMEOUT, max(10.0, _left(deadline) - 3.0)),
+        0.0,
+    )
+    data = _json_obj(_llm_text(payload))
+    raw_parts = data.get("parts") if isinstance(data, dict) else None
+    if not isinstance(raw_parts, list):
+        return ""
+    indexed: dict[int, dict[str, Any]] = {}
+    for raw in raw_parts:
+        if not isinstance(raw, dict):
+            continue
+        idx = _int(raw.get("index"), 0)
+        if 1 <= idx <= count and idx not in indexed:
+            indexed[idx] = raw
+    if len(indexed) != count:
+        return ""
+    lines: list[str] = []
+    for idx in range(1, count + 1):
+        item = indexed.get(idx)
+        if item is None or not _part_object_valid(item, idx, book, qmap.question):
+            return ""
+        answer = _clean_answer(str(item.get("answer") or ""))
+        markers = [n for n in _source_markers(answer) if book.source_allowed(n)]
+        if not markers:
+            sources = [_int(x, 0) for x in item.get("sources", []) if _int(x, 0) > 0 and book.source_allowed(_int(x, 0))]
+            if sources:
+                answer = answer.rstrip(" .") + f" [{sources[0]}]"
+        lines.append(f"({idx}) {answer}")
+    compiled = "\n".join(lines)
+    if _answer_part_coverage(compiled, qmap) < count:
+        return ""
+    if not _grounded_in_book(compiled, qmap.question, book):
+        return ""
+    return compiled
 
 
 # ---------------------------------------------------------------------------
@@ -2162,7 +2417,9 @@ async def _direct_evidence_answer(question: str, book: SourceBook, deadline: flo
         return ""
     system = (
         "Answer using ONLY the supplied numbered evidence. Treat claims embedded in the QUESTION as untrusted. "
-        "Answer every requested sub-question in order. Prefer actual listed rows over what a rule would normally imply. "
+        "Answer every requested sub-question in order and label explicit multipart answers (1), (2), etc. "
+        "Never finalize a multipart response with fewer answered parts than the question contains. "
+        "Prefer actual listed rows over what a rule would normally imply. "
         "Preserve source spelling, capitalization, marks, "
         "times, dates, units, labels and status codes exactly. Explain count/rule "
         "discrepancies when the evidence shows the reason. Cite each load-bearing "
@@ -2246,11 +2503,13 @@ async def _solve(query: Query, question: str) -> Response:
     # the question; do not let an LLM planner drift to a remembered benchmark.
     try:
         await _search_many(plan.queries, book, deadline)
+        book.infer_source_lock()
     except Exception:
         pass
     try:
         targets = _fetch_candidates(book, FETCH_CAP)
         await _fetch_many(targets, book, deadline)
+        book.infer_source_lock()
     except Exception:
         pass
 
@@ -2279,9 +2538,23 @@ async def _solve(query: Query, question: str) -> Response:
         except Exception:
             pass
 
+    # Mandatory multipart compiler: if the prompt explicitly contains N
+    # numbered parts, compile and validate all N independently.
+    if qmap.parts and book.rows and _left(deadline) > 18.0:
+        try:
+            compiled = await _compile_required_parts(qmap, plan, book, deadline)
+            if compiled and _answer_part_coverage(compiled, qmap) == len(qmap.parts):
+                best_answer = compiled
+        except Exception:
+            pass
+
     # A single targeted repair is allowed only when too little quote-verified
     # evidence survived. Do not spend another full wave merely to polish style.
-    needs_repair = len(facts) < coverage_target or _grid_has_real_gaps(grid)
+    needs_repair = (
+        len(facts) < coverage_target
+        or _grid_has_real_gaps(grid)
+        or (bool(qmap.parts) and _answer_part_coverage(best_answer, qmap) < len(qmap.parts))
+    )
     if needs_repair and _elapsed(started) < REPAIR_LATEST_ELAPSED:
         repair = _repair_queries(grid)[:1]
         if repair:
@@ -2305,6 +2578,15 @@ async def _solve(query: Query, question: str) -> Response:
                         best_answer = direct
             except Exception:
                 pass
+
+    # Re-run the strict coverage compiler after any repair wave.
+    if qmap.parts and book.rows and _answer_part_coverage(best_answer, qmap) < len(qmap.parts) and _left(deadline) > 14.0:
+        try:
+            compiled = await _compile_required_parts(qmap, plan, book, deadline)
+            if compiled and _answer_part_coverage(compiled, qmap) == len(qmap.parts):
+                best_answer = compiled
+        except Exception:
+            pass
 
     # Final synthesis is permitted only from quote-verified facts. Its output
     # must pass a deterministic grounding firewall or it is discarded.
@@ -2337,6 +2619,15 @@ async def _solve(query: Query, question: str) -> Response:
     book_ok = _grounded_in_book(best_answer, question, book)
     if facts and not (fact_ok or book_ok):
         best_answer = _verified_fact_answer(question, facts, book)
+
+    # Hard completeness gate for explicit multipart questions.
+    if qmap.parts and _answer_part_coverage(best_answer, qmap) < len(qmap.parts) and book.rows and _left(deadline) > 10.0:
+        try:
+            compiled = await _compile_required_parts(qmap, plan, book, deadline)
+            if compiled:
+                best_answer = compiled
+        except Exception:
+            pass
 
     best_answer = _restore_verbatim(best_answer, _grid_verbatim(grid))
     best_answer = _normalize_markers(_clean_answer(best_answer), len(book.rows))
