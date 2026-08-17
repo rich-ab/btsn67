@@ -1,4 +1,4 @@
-"""Harnyx SN67 miner 151 (richjg) — GroundedProof v7.
+"""Harnyx SN67 miner — ParallelProof v8.
 
 This candidate is built around a bounded evidence-compiler rather than a long
 conversational tool loop.  It is designed from a real local-eval failure where
@@ -8,7 +8,7 @@ count discrepancy, and finished more cleanly.
 
 Controller topology:
     question -> deterministic contract map -> deterministic retrieval plan
-             -> parallel search -> selective primary-page fetch
+             -> Parallel-primary search -> selective primary-page fetch
              -> proof-grid extraction -> quote-verification firewall
              -> verified-fact answer -> grounded answer compiler
              -> deterministic numeric/entity hallucination guard
@@ -21,6 +21,7 @@ Design goals:
 - explain discrepancy/counterfactual questions when the evidence supports why;
 - keep exact receipt-backed citation slices around decisive quotes;
 - never return the user's question as a fallback answer;
+- use Parallel as the fast primary retrieval path, with one DeSearch fallback only when necessary;
 - remain useful when one LLM/search/fetch stage fails.
 """
 
@@ -38,14 +39,15 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "groundedproof-v7.0"
+VERSION = "parallelproof-v8.0"
 
 # ---------------------------------------------------------------------------
 # Runtime policy
 # ---------------------------------------------------------------------------
 
 LLM_PROVIDER = "chutes"
-SEARCH_PROVIDER = "desearch"
+SEARCH_PROVIDER = "parallel"
+FALLBACK_SEARCH_PROVIDER = "desearch"
 
 PLAN_MODELS = (
     "google/gemma-4-31B-turbo-TEE",
@@ -68,7 +70,7 @@ WRITE_MODELS = (
 REVIEW_MODELS = (
     "google/gemma-4-31B-turbo-TEE",
     "deepseek-ai/DeepSeek-V3.2-TEE",
-    "Qwen/Qwen3.6-27B-TEE",
+    "Qwen/Qwen3.5-397B-A17B-TEE",
 )
 SCHEMA_MODELS = (
     "google/gemma-4-31B-turbo-TEE",
@@ -79,27 +81,28 @@ SCHEMA_MODELS = (
 # A Harnyx evaluation can have a larger outer timeout, but this agent commits
 # well before it.  The v3 local run used ~251s and left too little finalization
 # margin; v4 targets materially less.
-WALL_SECONDS = 215.0
-REPAIR_LATEST_ELAPSED = 135.0
-REVIEW_LATEST_ELAPSED = 170.0
-FORCE_COMMIT_ELAPSED = 192.0
+WALL_SECONDS = 180.0
+REPAIR_LATEST_ELAPSED = 105.0
+REVIEW_LATEST_ELAPSED = 135.0
+FORCE_COMMIT_ELAPSED = 158.0
 
 PLAN_TIMEOUT = 10.0
-# DeSearch was observed returning HTTP 200 only after ~31 seconds in local eval.
-# Give the provider enough time to finish its body instead of killing a healthy call.
-SEARCH_TIMEOUT = 72.0
-SEARCH_RETRY_TIMEOUT = 52.0
-FETCH_TIMEOUT = 55.0
-GRID_TIMEOUT = 48.0
-WRITE_TIMEOUT = 44.0
-REVIEW_TIMEOUT = 28.0
-SCHEMA_TIMEOUT = 22.0
-EMERGENCY_TIMEOUT = 45.0
+# Parallel is the primary retrieval provider. DeSearch is retained only as a
+# last-resort fallback because local runs showed 50-70+ second DeSearch latency.
+SEARCH_TIMEOUT = 24.0
+SEARCH_RETRY_TIMEOUT = 22.0
+DESEARCH_FALLBACK_TIMEOUT = 82.0
+FETCH_TIMEOUT = 32.0
+GRID_TIMEOUT = 42.0
+WRITE_TIMEOUT = 38.0
+REVIEW_TIMEOUT = 26.0
+SCHEMA_TIMEOUT = 20.0
+EMERGENCY_TIMEOUT = 36.0
 
-MAX_PLAN_QUERIES = 2
+MAX_PLAN_QUERIES = 3
 MAX_REPAIR_QUERIES = 1
-SEARCH_RESULTS = 9
-FETCH_CAP = 3
+SEARCH_RESULTS = 8
+FETCH_CAP = 4
 SEARCH_CONCURRENCY = 5
 FETCH_CONCURRENCY = 5
 MAX_SOURCES = 42
@@ -627,94 +630,71 @@ def _query_prefix(question: str) -> str:
 
 
 def _compact_queries(qmap: QuestionMap) -> list[str]:
-    """Build at most two high-signal searches without copying false claims.
+    """Build a few compact high-signal Parallel queries.
 
-    Many benchmark prompts have `source/event context: claim + questions`. Searching
-    the whole prompt contaminates retrieval with the false claim and makes DeSearch's
-    OR query slow. v7 searches the source/event anchor first and only then a compact
-    entity/topic variant when needed.
+    False claims in benchmark prompts are deliberately excluded. When a prompt
+    contrasts stages such as semifinal/final, issue stage-specific searches so
+    both official tables can surface independently instead of relying on one
+    broad query.
     """
     q = qmap.question
     low = q.lower()
     source = qmap.named_sources[0] if qmap.named_sources else ""
     prefix = _query_prefix(q)
+    years = list(dict.fromkeys(re.findall(r"\b(?:19|20)\d{2}\b", q)))[:2]
 
-    signal_words: list[str] = []
-    for word in (
-        "semifinal", "semi-final", "final", "qualifying", "qualification",
-        "standings", "ranking", "schedule", "score", "results", "table",
-        "report", "filing", "statistics", "record", "records",
-    ):
-        if word in low and word not in signal_words:
-            signal_words.append(word)
-
-    years = re.findall(r"\b(?:19|20)\d{2}\b", q)
-    years = list(dict.fromkeys(years))[:2]
-
-    # Pick a compact named entity that is not merely the named source/event brand.
-    entity = ""
-    for item in qmap.entities:
-        cleaned = _clean_space(item)
-        if not cleaned or len(cleaned.split()) > 4:
-            continue
-        if source and cleaned.lower() in source.lower():
-            continue
-        if "championship" in cleaned.lower() and len(cleaned.split()) > 2:
-            continue
-        entity = cleaned
-        break
-
-    q1_parts: list[str] = []
-    if source and source.lower() not in prefix.lower():
-        q1_parts.append(source)
-    if prefix:
-        q1_parts.append(prefix)
-    if signal_words:
-        q1_parts.extend(signal_words[:4])
-    q1 = _clean_space(" ".join(q1_parts))
-
-    # Second query is deliberately shorter and avoids verbs/assertions from the prompt.
-    topic_terms = []
     source_words = {x.lower() for x in _token_terms(source)}
-    for term in _token_terms(prefix + " " + q):
+    blocked = {
+        "commentary", "claims", "claim", "won", "winner", "usual", "exactly",
+        "competition", "results", "result", "official", "championships", "championship",
+    }
+    salient: list[str] = []
+    for term in _token_terms(prefix):
         key = term.lower()
-        if key in source_words:
+        if key in source_words or key in blocked or re.fullmatch(r"(?:19|20)\d{2}", term):
             continue
-        if key in {"commentary", "claims", "claim", "won", "winner", "usual", "exactly"}:
-            continue
-        if term not in topic_terms:
-            topic_terms.append(term)
-        if len(topic_terms) >= 8:
+        if term not in salient:
+            salient.append(term)
+        if len(salient) >= 6:
             break
-    q2_parts = [source] if source else []
-    q2_parts.extend(years)
-    q2_parts.extend(topic_terms[:6])
-    if entity and entity.lower() not in " ".join(q2_parts).lower():
-        q2_parts.append(entity)
-    q2_parts.extend(signal_words[:3])
-    q2_parts.append("results")
-    q2_words: list[str] = []
-    q2_seen: set[str] = set()
-    for piece in q2_parts:
-        for word in piece.split():
-            key = word.lower()
-            if key in q2_seen:
-                continue
-            q2_seen.add(key)
-            q2_words.append(word)
-    q2 = _clean_space(" ".join(q2_words))
+
+    base: list[str] = []
+    if source:
+        base.extend(source.split())
+    base.extend(years)
+    base.extend(salient[:5])
+    if not base:
+        base.extend(_token_terms(prefix)[:8])
+
+    variants: list[list[str]] = []
+    if "semifinal" in low or "semi-final" in low:
+        variants.append(base + ["semifinal", "results"])
+    if re.search(r"\bfinal\b", low):
+        variants.append(base + ["final", "results"])
+    if any(word in low for word in ("qualif", "advancement", "advance")):
+        variants.append(base + ["qualification", "rule", "results"])
+    if not variants:
+        variants.append(base + ["results"])
 
     out: list[str] = []
-    for candidate in (q1, q2):
-        candidate = _cap(candidate, 240)
+    for parts in variants:
+        words: list[str] = []
+        seen: set[str] = set()
+        for piece in parts:
+            for word in str(piece).split():
+                key = word.lower().strip(".,;:()[]{}\"'")
+                if not key or key in seen:
+                    continue
+                seen.add(key)
+                words.append(word.strip(".,;:()[]{}\"'"))
+        candidate = _clean_space(" ".join(words[:13]))
         if candidate and candidate.lower() not in [x.lower() for x in out]:
             out.append(candidate)
         if len(out) >= MAX_PLAN_QUERIES:
             break
     if not out:
-        out.append(_cap(_clean_space(q), 220))
+        out.append(_cap(_clean_space(prefix or q), 180))
     return out
-
 
 def _fallback_plan(qmap: QuestionMap) -> ResearchPlan:
     plan = ResearchPlan()
@@ -971,12 +951,68 @@ def _ingest_search(payload: Any, book: SourceBook) -> list[int]:
     return numbers
 
 
-async def _search_many(queries: list[str], book: SourceBook, deadline: float) -> list[int]:
-    """Run one concise DeSearch query at a time with realistic provider deadlines.
+async def _parallel_search_call(
+    queries: list[str],
+    book: SourceBook,
+    deadline: float,
+    advanced: bool = False,
+) -> list[int]:
+    clean: list[str] = []
+    for raw in queries:
+        q = _clean_space(raw)
+        if q and q.lower() not in [x.lower() for x in clean]:
+            clean.append(_cap(q, 220))
+        if len(clean) >= MAX_PLAN_QUERIES:
+            break
+    if not clean or _left(deadline) < 10.0:
+        return []
+    timeout = min(SEARCH_TIMEOUT if not advanced else SEARCH_RETRY_TIMEOUT, max(8.0, _left(deadline) - 5.0))
+    try:
+        payload = await search_web(
+            clean,
+            provider="parallel",
+            num=SEARCH_RESULTS,
+            timeout=timeout,
+            provider_extra={
+                "mode": "advanced" if advanced else "basic",
+                "max_chars_total": 28000 if advanced else 22000,
+                "excerpt_settings": {"max_chars_per_result": 4200 if advanced else 3200},
+            },
+        )
+    except Exception:
+        return []
+    for q in clean:
+        if q not in book.searched:
+            book.searched.append(q)
+    return _ingest_search(payload, book)
 
-    In local eval, DeSearch returned HTTP 200 after ~31 seconds but v6 killed the
-    request at 34 seconds before the body completed. v7 gives the first concise
-    query a 72-second envelope and avoids combining five variants into one OR query.
+
+async def _desearch_last_resort(query: str, book: SourceBook, deadline: float) -> list[int]:
+    """One slow-provider fallback only after Parallel has failed completely."""
+    q = _clean_space(query)
+    if not q or _left(deadline) < 90.0:
+        return []
+    timeout = min(DESEARCH_FALLBACK_TIMEOUT, max(20.0, _left(deadline) - 7.0))
+    try:
+        payload = await search_web(
+            q,
+            provider="desearch",
+            num=SEARCH_RESULTS,
+            timeout=timeout,
+        )
+    except Exception:
+        return []
+    if q not in book.searched:
+        book.searched.append(q)
+    return _ingest_search(payload, book)
+
+
+async def _search_many(queries: list[str], book: SourceBook, deadline: float) -> list[int]:
+    """Parallel-first retrieval with one bounded quality escalation.
+
+    Parallel's Harnyx adapter applies `num` as `max_results` at request time and
+    supports excerpt limits, so this path avoids the long full-response latency
+    observed with DeSearch. A single DeSearch call remains only as a last resort.
     """
     unique: list[str] = []
     for raw in queries:
@@ -988,38 +1024,25 @@ async def _search_many(queries: list[str], book: SourceBook, deadline: float) ->
     if not unique:
         return []
 
-    collected: list[int] = []
-    for idx, q in enumerate(unique[:2]):
-        if _left(deadline) < 24.0:
-            break
-        cap = SEARCH_TIMEOUT if idx == 0 else SEARCH_RETRY_TIMEOUT
-        timeout = min(cap, max(12.0, _left(deadline) - 6.0))
-        try:
-            payload = await search_web(
-                q,
-                provider=SEARCH_PROVIDER,
-                num=SEARCH_RESULTS,
-                timeout=timeout,
-            )
-            if q not in book.searched:
-                book.searched.append(q)
-            numbers = _ingest_search(payload, book)
-            for number in numbers:
+    collected = await _parallel_search_call(unique, book, deadline, False)
+    if collected:
+        strongest = max(
+            (_int((book.row(number) or {}).get("authority"), 0) for number in collected),
+            default=0,
+        )
+        # Escalate quality only when source-bound questions did not surface an
+        # authoritative source. Do not duplicate a good search just for volume.
+        if strongest < 9 and _left(deadline) > 35.0:
+            extra = await _parallel_search_call(unique[:2], book, deadline, True)
+            for number in extra:
                 if number not in collected:
                     collected.append(number)
-            if numbers:
-                strongest = max(
-                    (_int((book.row(number) or {}).get("authority"), 0) for number in numbers),
-                    default=0,
-                )
-                # One successful authoritative result set is enough; fetch_page will
-                # provide deeper evidence. Only spend a second search on weak results.
-                if strongest >= 10 or len(numbers) >= 4:
-                    break
-        except Exception:
-            continue
-    return collected
+        return collected
 
+    # Parallel failed completely. One paid DeSearch fallback is preferable to
+    # silently answering a source-bound question from model memory.
+    fallback = await _desearch_last_resort(unique[0], book, deadline)
+    return fallback
 
 def _fetch_candidates(book: SourceBook, cap: int) -> list[str]:
     ranked: list[tuple[int, int, str]] = []
@@ -1046,6 +1069,19 @@ def _fetch_candidates(book: SourceBook, cap: int) -> list[str]:
     return out
 
 
+def _fetch_objective(book: SourceBook) -> str:
+    parts = book.qmap.parts[:6] if book.qmap.parts else book.plan.must_answer[:6]
+    focus = "; ".join(parts)
+    if not focus:
+        focus = " ".join(book.plan.focus_terms[:12])
+    instruction = (
+        "Extract exact source text needed to answer these requested facts. "
+        "Preserve result-table rows, names, marks, dates, units, qualification "
+        "labels/status codes, totals, and any rule explaining a discrepancy: " + focus
+    )
+    return _cap(_clean_space(instruction), 1300)
+
+
 async def _fetch_one(url: str, book: SourceBook) -> int:
     target = (url or "").strip()
     if not target:
@@ -1055,8 +1091,14 @@ async def _fetch_one(url: str, book: SourceBook) -> int:
     try:
         payload = await fetch_page(
             target,
-            provider=SEARCH_PROVIDER,
+            provider="parallel",
             timeout=FETCH_TIMEOUT,
+            provider_extra={
+                "objective": _fetch_objective(book),
+                "max_chars_total": 30000,
+                "excerpt_settings": {"max_chars_per_result": 9000},
+                "full_content": True,
+            },
         )
     except Exception:
         return 0
@@ -1096,7 +1138,7 @@ async def _fetch_many(urls: list[str], book: SourceBook, deadline: float) -> Non
         return
     tasks = [asyncio.create_task(_fetch_one(url, book)) for url in unique]
     try:
-        timeout = min(FETCH_TIMEOUT + 8.0, max(14.0, _left(deadline) - 5.0))
+        timeout = min(FETCH_TIMEOUT + 6.0, max(12.0, _left(deadline) - 5.0))
         done, pending = await asyncio.wait(tasks, timeout=timeout)
         for task in pending:
             task.cancel()
@@ -1110,6 +1152,111 @@ async def _fetch_many(urls: list[str], book: SourceBook, deadline: float) -> Non
             if not task.done():
                 task.cancel()
         return
+
+
+# ---------------------------------------------------------------------------
+# Deterministic table signals
+# ---------------------------------------------------------------------------
+
+
+def _row_matches(text: str) -> list[re.Match[str]]:
+    body = text or ""
+    explicit = list(re.finditer(r"(?im)^\s*ROW\s+(\d+)\b[^\n]*", body))
+    if len(explicit) >= 4:
+        return explicit
+    # Parallel extracts often render official result tables as markdown/plain rows
+    # rather than Harnyx's debug-style `ROW n` representation. Only enable this
+    # fallback when the page visibly looks like a position/result table.
+    low = body.lower()
+    if not (("athlete" in low or "name" in low or "competitor" in low) and ("pos" in low or "position" in low)):
+        return explicit
+    table = list(re.finditer(r"(?m)^\s*\|?\s*(\d{1,3})\s*(?:\||\s{2,})[^\n]*", body))
+    return table if len(table) >= 4 else explicit
+
+
+def _is_final_result_source(row: dict[str, Any]) -> bool:
+    hay = f"{row.get('title','')} {row.get('url','')}".lower()
+    return "final" in hay and "semi-final" not in hay and "semifinal" not in hay
+
+
+def _table_signal_records(qmap: QuestionMap, book: SourceBook) -> list[dict[str, Any]]:
+    signals: list[dict[str, Any]] = []
+    for number in book.ranked()[:10]:
+        row = book.row(number)
+        if row is None:
+            continue
+        body = str(row.get("text") or "")
+        matches = _row_matches(body)
+        if len(matches) < 4:
+            continue
+        nums: list[int] = []
+        for m in matches:
+            value = _int(m.group(1), 0)
+            if value > 0 and value not in nums:
+                nums.append(value)
+        if len(nums) < 4:
+            continue
+        first = matches[0].start()
+        last = matches[-1].end()
+        quote = body[first:last]
+        quote = quote[:12000]
+        signals.append({
+            "source": number,
+            "row_count": len(nums),
+            "min_row": min(nums),
+            "max_row": max(nums),
+            "is_final": _is_final_result_source(row),
+            "quote": quote,
+        })
+    return signals
+
+
+def _table_signal_text(qmap: QuestionMap, book: SourceBook) -> str:
+    lines: list[str] = []
+    for item in _table_signal_records(qmap, book)[:6]:
+        role = "final-result candidate" if item.get("is_final") else "result-table candidate"
+        lines.append(
+            f"[{item['source']}] {role}: detected {item['row_count']} explicit ROW entries "
+            f"(ROW {item['min_row']} through ROW {item['max_row']})."
+        )
+    return "\n".join(lines)
+
+
+def _augment_grid_table_count(grid: dict[str, Any], qmap: QuestionMap, book: SourceBook) -> None:
+    low = qmap.question.lower()
+    if not (qmap.computed or "how many" in low or "number of" in low):
+        return
+    records = _table_signal_records(qmap, book)
+    if not records:
+        return
+    chosen: dict[str, Any] | None = None
+    if "final" in low:
+        finals = [item for item in records if item.get("is_final")]
+        if finals:
+            chosen = max(finals, key=lambda item: _int(item.get("row_count"), 0))
+    if chosen is None:
+        chosen = max(records, key=lambda item: _int(item.get("row_count"), 0))
+    source = _int(chosen.get("source"), 0)
+    count = _int(chosen.get("row_count"), 0)
+    quote = str(chosen.get("quote") or "")
+    if source <= 0 or count <= 0 or len(quote) < 20:
+        return
+    facts = grid.get("facts")
+    if not isinstance(facts, list):
+        facts = []
+        grid["facts"] = facts
+    # Do not add a duplicate if the model already stated this count.
+    for item in facts:
+        if isinstance(item, dict) and str(count) in str(item.get("claim") or "") and _int(item.get("source"), 0) == source:
+            return
+    label = "official final result list" if chosen.get("is_final") and "final" in low else "result table"
+    facts.append({
+        "claim": f"The {label} contains {count} explicitly listed rows.",
+        "source": source,
+        "quote": quote,
+        "requirement": "deterministic count from the actual listed result rows",
+    })
+    book.retain(source, quote)
 
 
 # ---------------------------------------------------------------------------
@@ -1145,7 +1292,8 @@ def _retain_grid_quotes(grid: dict[str, Any], book: SourceBook) -> None:
 async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, deadline: float) -> dict[str, Any]:
     fallback = _fallback_grid(qmap, plan, book)
     evidence = book.pack(MAX_PACK_CHARS)
-    if not evidence or _money_left() < MIN_GRID_USD or _left(deadline) < 52.0:
+    if not evidence or _money_left() < MIN_GRID_USD or _left(deadline) < 46.0:
+        _augment_grid_table_count(fallback, qmap, book)
         return fallback
     system = (
         "You are a CLOSED-BOOK evidence adjudicator. The supplied evidence is the entire world you may use. "
@@ -1160,7 +1308,7 @@ async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, d
         "table before selecting the winner. If the question compares a count/rule/result and the evidence reveals WHY they "
         "differ, record that explanation. For set/ranking questions, verify the pool and exclusions. Return JSON only."
     )
-    user = f'''QUESTION:\n{qmap.question}\n\nQUESTION MAP:\n{qmap.block()}\n\nRESEARCH PLAN:\n{plan.block()}\n\nEVIDENCE:\n{evidence}\n\nReturn exactly:\n{{"draft_answer":"a complete evidence-supported answer with [source-number] markers","facts":[{{"claim":"atomic factual claim using source-exact values","source":1,"quote":"exact verbatim quote","requirement":"which requested part it answers"}}],"verbatim_values":["exact source spelling/capitalization/mark/value that must survive final writing"],"coverage":[{{"requirement":"requested part","status":"proved|partial|missing","sources":[1]}}],"gaps":["only genuinely unresolved facts"],"repair_queries":["high precision query for a gap"],"comparison_explanation":"source-supported reason for a discrepancy, or empty"}}\n\nDo not create a gap merely because you could add background detail. If all requested outputs are proved, gaps must be [].'''
+    user = f'''QUESTION:\n{qmap.question}\n\nQUESTION MAP:\n{qmap.block()}\n\nRESEARCH PLAN:\n{plan.block()}\n\nDETERMINISTIC TABLE SIGNALS (derived only from explicit ROW labels; use when relevant):\n{_table_signal_text(qmap, book) or "none"}\n\nEVIDENCE:\n{evidence}\n\nReturn exactly:\n{{"draft_answer":"a complete evidence-supported answer with [source-number] markers","facts":[{{"claim":"atomic factual claim using source-exact values","source":1,"quote":"exact verbatim quote","requirement":"which requested part it answers"}}],"verbatim_values":["exact source spelling/capitalization/mark/value that must survive final writing"],"coverage":[{{"requirement":"requested part","status":"proved|partial|missing","sources":[1]}}],"gaps":["only genuinely unresolved facts"],"repair_queries":["high precision query for a gap"],"comparison_explanation":"source-supported reason for a discrepancy, or empty"}}\n\nDo not create a gap merely because you could add background detail. If all requested outputs are proved, gaps must be [].'''
     payload = await _chat(
         GRID_MODELS,
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -1171,7 +1319,8 @@ async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, d
     )
     data = _json_object(_llm_text(payload))
     if data is None:
-        return fallback
+        data = fallback
+    _augment_grid_table_count(data, qmap, book)
     _retain_grid_quotes(data, book)
     return data
 
