@@ -1,4 +1,4 @@
-"""Harnyx SN67 miner — SourceLock CoverageCompiler v10.
+"""Harnyx SN67 miner — 151 Richjg.
 
 This candidate is built around a bounded evidence-compiler rather than a long
 conversational tool loop.  It is designed from a real local-eval failure where
@@ -20,6 +20,8 @@ Design goals:
 - answer every numbered/multipart sub-question in order;
 - enforce hard source locking for prompts that say using only/solely/from the official named source;
 - refuse to finalize a multipart answer until every required part has grounded evidence;
+- resolve same-slot factual contradictions before any answer can leave the controller;
+- prefer section-scoped table counts over whole-page row aggregates;
 - explain discrepancy/counterfactual questions when the evidence supports why;
 - keep exact receipt-backed citation slices around decisive quotes;
 - never return the user's question as a fallback answer;
@@ -41,7 +43,7 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "parallelproof-v8.0"
+VERSION = "conflictsafe-v11.0"
 
 # ---------------------------------------------------------------------------
 # Runtime policy
@@ -1418,14 +1420,46 @@ def _row_number_from_line(line: str) -> int:
     return 0
 
 
-def _section_role(line: str, current: str) -> str:
+def _source_stage(row: dict[str, Any]) -> str:
+    """Infer the result stage from the source URL/title without using page body claims."""
+    hay = f"{row.get('title','')} {row.get('url','')}".lower()
+    if re.search(r"(?:semi[- ]?final|semi-final/result|semifinal/result)", hay):
+        return "semifinal"
+    if re.search(r"(?:/final/result\b|\bfinal result\b)", hay) and "semi" not in hay:
+        return "final"
+    return "unknown"
+
+
+def _section_role(line: str, current: str, source_stage: str = "unknown") -> str:
+    """Map a visible heading to a semantic table scope.
+
+    World Athletics result pages can contain start lists, official results, race
+    analysis and other tables on one page.  Counting rows across those sections
+    created the v10 61-row contradiction.  Non-result sections therefore get
+    explicit roles that are never eligible for result-field counts.
+    """
     low = _clean_space(line).lower().strip("*# _-")
     if not low:
         return current
+
+    if "official startlist" in low or "official start list" in low or low == "startlist":
+        return "startlist"
+    if "race analysis" in low or "photo finish" in low or "start list" in low:
+        return "analysis"
+    if "official result" in low:
+        return source_stage if source_stage in {"final", "semifinal"} else current
+
     if re.search(r"\bsemi[- ]?final\s*1\b", low):
         return "semifinal1"
     if re.search(r"\bsemi[- ]?final\s*2\b", low):
         return "semifinal2"
+
+    # Some World Athletics semifinal pages label their two races as Heat 1/2.
+    if source_stage == "semifinal" and re.search(r"\bheat\s*1\b", low):
+        return "semifinal1"
+    if source_stage == "semifinal" and re.search(r"\bheat\s*2\b", low):
+        return "semifinal2"
+
     if re.search(r"\bsemi[- ]?final\b", low):
         return "semifinal"
     if re.search(r"\bfinal\b", low) and "semi" not in low:
@@ -1436,70 +1470,129 @@ def _section_role(line: str, current: str) -> str:
 
 
 def _is_final_result_source(row: dict[str, Any]) -> bool:
-    hay = f"{row.get('title','')} {row.get('url','')}".lower()
-    return "final" in hay and "semi-final" not in hay and "semifinal" not in hay
+    return _source_stage(row) == "final"
+
+
+def _record_from_entries(
+    number: int,
+    body: str,
+    role: str,
+    entries: list[tuple[int, int, int]],
+) -> dict[str, Any] | None:
+    if role not in {"final", "semifinal", "semifinal1", "semifinal2", "heat"}:
+        return None
+    if len(entries) < 4:
+        return None
+    nums = [value for value, _, _ in entries]
+    # A true result table is one run.  If a page restarts numbering, the caller
+    # flushes the previous run before this helper is invoked.
+    unique: list[int] = []
+    for value in nums:
+        if value not in unique:
+            unique.append(value)
+    if len(unique) < 4:
+        return None
+    minimum = min(unique)
+    maximum = max(unique)
+    contiguous = minimum == 1 and unique == list(range(1, maximum + 1))
+    first = entries[0][1]
+    last = entries[-1][2]
+    return {
+        "source": number,
+        "row_count": len(unique),
+        "min_row": minimum,
+        "max_row": maximum,
+        "role": role,
+        "is_final": role == "final",
+        "contiguous": contiguous,
+        "quote": body[first:last][:14000],
+    }
 
 
 def _table_records_for_row(number: int, row: dict[str, Any]) -> list[dict[str, Any]]:
+    """Return section-scoped table runs from one fetched/search source.
+
+    Important: never deduplicate all ROW labels across an entire page.  Result
+    pages may contain several numbered tables.  A restart (e.g. 14 -> 1) or a
+    section-role change closes the current run.
+    """
     body = str(row.get("text") or "")
     if not body:
         return []
 
-    # Harnyx/debug materializations with explicit ROW labels are already one table.
-    explicit = list(re.finditer(r"(?im)^\s*ROW\s+(\d+)\b[^\n]*", body))
-    if len(explicit) >= 4:
-        nums: list[int] = []
-        for m in explicit:
-            value = _int(m.group(1), 0)
-            if value > 0 and value not in nums:
-                nums.append(value)
-        if len(nums) >= 4:
-            quote = body[explicit[0].start():explicit[-1].end()][:14000]
-            role = "final" if _is_final_result_source(row) else "unknown"
-            return [{
-                "source": number,
-                "row_count": len(nums),
-                "min_row": min(nums),
-                "max_row": max(nums),
-                "role": role,
-                "is_final": role == "final",
-                "quote": quote,
-            }]
-
-    # Markdown/plain pages may contain several tables (heats, semis, final).
-    # Group rows by the nearest visible stage heading instead of deduplicating row
-    # numbers across the entire page.
-    groups: dict[str, list[tuple[int, int, int]]] = {}
-    current = "final" if _is_final_result_source(row) else "unknown"
+    source_stage = _source_stage(row)
+    current = source_stage
+    entries: list[tuple[int, int, int]] = []
+    records: list[dict[str, Any]] = []
     offset = 0
+    last_value = 0
+
+    def flush() -> None:
+        nonlocal entries, last_value
+        record = _record_from_entries(number, body, current, entries)
+        if record is not None:
+            records.append(record)
+        entries = []
+        last_value = 0
+
     for raw_line in body.splitlines(keepends=True):
-        current = _section_role(raw_line, current)
+        new_role = _section_role(raw_line, current, source_stage)
+        if new_role != current:
+            flush()
+            current = new_role
+
         value = _row_number_from_line(raw_line)
         if value > 0:
-            groups.setdefault(current, []).append((value, offset, offset + len(raw_line)))
+            # Numbering restart means a new table even if the surrounding page
+            # did not expose a clean heading in extracted text.
+            if entries and value <= last_value:
+                flush()
+            if current in {"final", "semifinal", "semifinal1", "semifinal2", "heat"}:
+                entries.append((value, offset, offset + len(raw_line)))
+                last_value = value
         offset += len(raw_line)
-
-    records: list[dict[str, Any]] = []
-    for role, entries in groups.items():
-        nums: list[int] = []
-        for value, _, _ in entries:
-            if value not in nums:
-                nums.append(value)
-        if len(nums) < 4:
-            continue
-        first = entries[0][1]
-        last = entries[-1][2]
-        records.append({
-            "source": number,
-            "row_count": len(nums),
-            "min_row": min(nums),
-            "max_row": max(nums),
-            "role": role,
-            "is_final": role == "final",
-            "quote": body[first:last][:14000],
-        })
+    flush()
     return records
 
+
+def _record_specificity(item: dict[str, Any], qmap: QuestionMap, book: SourceBook) -> int:
+    source = _int(item.get("source"), 0)
+    row = book.row(source) or {}
+    score = 0
+    role = str(item.get("role") or "")
+    url = str(row.get("url") or "").lower()
+    if role == "final":
+        score += 100
+    if item.get("contiguous"):
+        score += 60
+    if "/final/result" in url and role == "final":
+        score += 80
+    if "/semi-final/result" in url and role.startswith("semifinal"):
+        score += 70
+    if book.source_allowed(source):
+        score += 50
+    score += min(40, max(0, _int(row.get("authority"), 0)))
+    # Do not reward a larger row count.  v10's failure came from treating a
+    # broad page aggregate as "more complete" merely because it was larger.
+    return score
+
+
+def _best_table_record(qmap: QuestionMap, book: SourceBook, role: str) -> dict[str, Any] | None:
+    records = _table_signal_records(qmap, book)
+    candidates = [item for item in records if str(item.get("role") or "") == role]
+    if role == "final":
+        candidates = [item for item in candidates if item.get("contiguous") and _int(item.get("min_row"), 0) == 1]
+    if not candidates:
+        return None
+    candidates.sort(
+        key=lambda item: (
+            _record_specificity(item, qmap, book),
+            1 if item.get("contiguous") else 0,
+            -_int(item.get("source"), 0),
+        ),
+        reverse=True,
+    )
+    return candidates[0]
 
 def _table_signal_records(qmap: QuestionMap, book: SourceBook) -> list[dict[str, Any]]:
     signals: list[dict[str, Any]] = []
@@ -1522,31 +1615,108 @@ def _table_signal_text(qmap: QuestionMap, book: SourceBook) -> str:
     return "\n".join(lines)
 
 
+def _final_count_from_record(record: dict[str, Any] | None) -> int:
+    if not isinstance(record, dict):
+        return 0
+    count = _int(record.get("row_count"), 0)
+    minimum = _int(record.get("min_row"), 0)
+    maximum = _int(record.get("max_row"), 0)
+    if record.get("contiguous") and minimum == 1 and maximum == count:
+        return maximum
+    return 0
+
+
+def _final_count_claim_value(text: str) -> int:
+    """Extract a claimed final-field/list count, not a finishing position."""
+    value = _clean_space(text)
+    low = value.lower()
+    if "final" not in low:
+        return 0
+    patterns = (
+        r"(?:official\s+)?final(?:\s+result)?(?:\s+list|\s+field)?[^.;]{0,70}?(?:contains|has|lists|shows|includes|comprises|with)\s+(?:exactly\s+)?(\d{1,3})\s+(?:(?:explicitly|officially|listed|qualified|total)\s+){0,4}(?:athletes|rows|entries|finalists)",
+        r"(?:contains|has|lists|shows|includes|comprises)\s+(?:exactly\s+)?(\d{1,3})\s+(?:(?:explicitly|officially|listed|qualified|total)\s+){0,4}(?:athletes|rows|entries|finalists)[^.;]{0,70}?\bfinal\b",
+        r"(\d{1,3})\s+(?:(?:explicitly|officially|listed|qualified|total)\s+){0,4}(?:athletes|rows|entries|finalists)[^.;]{0,70}?(?:official\s+)?final(?:\s+result)?(?:\s+list|\s+field)?",
+    )
+    for pattern in patterns:
+        m = re.search(pattern, value, flags=re.I)
+        if m:
+            return _int(m.group(1), 0)
+    return 0
+
+
+def _is_final_count_fact(item: dict[str, Any]) -> bool:
+    claim = str(item.get("claim") or "")
+    requirement = str(item.get("requirement") or "").lower()
+    slot = str(item.get("slot") or "").lower()
+    if slot == "final_result_count":
+        return True
+    if "deterministic count" in requirement:
+        return True
+    return _final_count_claim_value(claim) > 0
+
+
+def _sanitize_grid_conflicts(grid: dict[str, Any], qmap: QuestionMap, book: SourceBook) -> None:
+    """Resolve same-slot fact conflicts before synthesis.
+
+    For an explicit final-list count, a contiguous section-scoped final table is
+    authoritative over broad page aggregates or LLM-derived competing counts.
+    """
+    low = qmap.question.lower()
+    if "final" not in low or not ("how many" in low or "number of" in low or qmap.computed):
+        return
+    record = _best_table_record(qmap, book, "final")
+    authoritative = _final_count_from_record(record)
+    if authoritative <= 0:
+        return
+
+    facts = grid.get("facts")
+    if not isinstance(facts, list):
+        facts = []
+        grid["facts"] = facts
+
+    cleaned: list[Any] = []
+    for item in facts:
+        if not isinstance(item, dict):
+            cleaned.append(item)
+            continue
+        if _is_final_count_fact(item):
+            value = _final_count_claim_value(str(item.get("claim") or ""))
+            if value and value != authoritative:
+                continue
+            # Replace all same-slot count claims with one deterministic claim.
+            continue
+        cleaned.append(item)
+    facts[:] = cleaned
+
+    source = _int(record.get("source"), 0) if isinstance(record, dict) else 0
+    quote = str(record.get("quote") or "") if isinstance(record, dict) else ""
+    if source > 0 and len(quote) >= 20:
+        facts.append({
+            "claim": f"The official final result list contains {authoritative} explicitly listed rows.",
+            "source": source,
+            "quote": quote,
+            "requirement": "deterministic count from the official final result section",
+            "slot": "final_result_count",
+            "confidence": 100,
+        })
+        book.retain(source, quote)
+
+
 def _augment_grid_table_count(grid: dict[str, Any], qmap: QuestionMap, book: SourceBook) -> None:
     low = qmap.question.lower()
     if not (qmap.computed or "how many" in low or "number of" in low):
         return
-    records = _table_signal_records(qmap, book)
-    if not records:
+
+    if "final" in low:
+        chosen = _best_table_record(qmap, book, "final")
+    else:
+        records = [item for item in _table_signal_records(qmap, book) if item.get("contiguous")]
+        chosen = max(records, key=lambda item: _record_specificity(item, qmap, book), default=None)
+    if chosen is None:
         return
 
-    chosen: dict[str, Any] | None = None
-    if "final" in low:
-        finals = [item for item in records if item.get("is_final")]
-        if finals:
-            # Prefer the most complete final section, not a semifinal table with
-            # fewer rows or an unrelated heat table with more rows.
-            chosen = max(finals, key=lambda item: (_int(item.get("max_row"), 0), _int(item.get("row_count"), 0)))
-    if chosen is None:
-        chosen = max(records, key=lambda item: (_int(item.get("row_count"), 0), _int(item.get("max_row"), 0)))
-
     source = _int(chosen.get("source"), 0)
-    count = _int(chosen.get("row_count"), 0)
-    max_row = _int(chosen.get("max_row"), 0)
-    # For complete 1..N position tables, the terminal position is the strongest
-    # deterministic count. Otherwise use the number of unique listed rows.
-    if _int(chosen.get("min_row"), 0) == 1 and max_row >= count:
-        count = max_row
+    count = _final_count_from_record(chosen) if chosen.get("is_final") else _int(chosen.get("row_count"), 0)
     quote = str(chosen.get("quote") or "")
     if source <= 0 or count <= 0 or len(quote) < 20:
         return
@@ -1555,24 +1725,61 @@ def _augment_grid_table_count(grid: dict[str, Any], qmap: QuestionMap, book: Sou
     if not isinstance(facts, list):
         facts = []
         grid["facts"] = facts
-
-    # Remove older deterministic row-count claims for the same requirement; a
-    # later, stage-aware final-table count should replace them rather than coexist.
-    cleaned: list[Any] = []
-    for item in facts:
-        if isinstance(item, dict) and str(item.get("requirement") or "") == "deterministic count from the actual listed result rows":
-            continue
-        cleaned.append(item)
-    facts[:] = cleaned
-
-    label = "official final result list" if chosen.get("is_final") and "final" in low else "result table"
     facts.append({
-        "claim": f"The {label} contains {count} explicitly listed rows.",
+        "claim": (
+            f"The official final result list contains {count} explicitly listed rows."
+            if chosen.get("is_final") and "final" in low
+            else f"The result table contains {count} explicitly listed rows."
+        ),
         "source": source,
         "quote": quote,
-        "requirement": "deterministic count from the actual listed result rows",
+        "requirement": (
+            "deterministic count from the official final result section"
+            if chosen.get("is_final") and "final" in low
+            else "deterministic count from the actual listed result rows"
+        ),
+        "slot": "final_result_count" if chosen.get("is_final") and "final" in low else "table_count",
+        "confidence": 100,
     })
     book.retain(source, quote)
+    _sanitize_grid_conflicts(grid, qmap, book)
+
+
+def _sanitize_answer_conflicts(answer: str, qmap: QuestionMap, book: SourceBook) -> str:
+    """Drop final-count statements that contradict the scoped result table."""
+    value = (answer or "").strip()
+    if not value:
+        return value
+    record = _best_table_record(qmap, book, "final") if "final" in qmap.question.lower() else None
+    authoritative = _final_count_from_record(record)
+    if authoritative <= 0:
+        return value
+
+    multiline = "\n" in value
+    segments = value.splitlines() if multiline else re.split(r"(?<=[.!?])\s+", value)
+    kept: list[str] = []
+    for segment in segments:
+        claimed = _final_count_claim_value(segment)
+        if claimed > 0 and claimed != authoritative:
+            continue
+        kept.append(segment)
+    result = ("\n" if multiline else " ").join(x for x in kept if x.strip()).strip()
+    return result or value
+
+
+def _answer_has_final_count_conflict(answer: str, qmap: QuestionMap, book: SourceBook) -> bool:
+    record = _best_table_record(qmap, book, "final") if "final" in qmap.question.lower() else None
+    authoritative = _final_count_from_record(record)
+    if authoritative <= 0:
+        return False
+    segments = (answer or "").splitlines()
+    if not segments:
+        segments = [answer or ""]
+    for segment in segments:
+        claimed = _final_count_claim_value(segment)
+        if claimed > 0 and claimed != authoritative:
+            return True
+    return False
 
 
 # ---------------------------------------------------------------------------
@@ -1610,6 +1817,7 @@ async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, d
     evidence = book.pack(MAX_PACK_CHARS)
     if not evidence or _money_left() < MIN_GRID_USD or _left(deadline) < 46.0:
         _augment_grid_table_count(fallback, qmap, book)
+        _sanitize_grid_conflicts(fallback, qmap, book)
         return fallback
     system = (
         "You are a CLOSED-BOOK evidence adjudicator. The supplied evidence is the entire world you may use. "
@@ -1624,7 +1832,7 @@ async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, d
         "table before selecting the winner. If the question compares a count/rule/result and the evidence reveals WHY they "
         "differ, record that explanation. For set/ranking questions, verify the pool and exclusions. Return JSON only."
     )
-    user = f'''QUESTION:\n{qmap.question}\n\nQUESTION MAP:\n{qmap.block()}\n\nRESEARCH PLAN:\n{plan.block()}\n\nDETERMINISTIC TABLE SIGNALS (derived only from explicit ROW labels; use when relevant):\n{_table_signal_text(qmap, book) or "none"}\n\nEVIDENCE:\n{evidence}\n\nReturn exactly:\n{{"draft_answer":"a complete evidence-supported answer with [source-number] markers","facts":[{{"claim":"atomic factual claim using source-exact values","source":1,"quote":"exact verbatim quote","requirement":"which requested part it answers"}}],"verbatim_values":["exact source spelling/capitalization/mark/value that must survive final writing"],"coverage":[{{"requirement":"requested part","status":"proved|partial|missing","sources":[1]}}],"gaps":["only genuinely unresolved facts"],"repair_queries":["high precision query for a gap"],"comparison_explanation":"source-supported reason for a discrepancy, or empty"}}\n\nDo not create a gap merely because you could add background detail. If all requested outputs are proved, gaps must be [].'''
+    user = f'''QUESTION:\n{qmap.question}\n\nQUESTION MAP:\n{qmap.block()}\n\nRESEARCH PLAN:\n{plan.block()}\n\nDETERMINISTIC TABLE SIGNALS (section-scoped parsed result rows; use when relevant):\n{_table_signal_text(qmap, book) or "none"}\n\nEVIDENCE:\n{evidence}\n\nReturn exactly:\n{{"draft_answer":"a complete evidence-supported answer with [source-number] markers","facts":[{{"claim":"atomic factual claim using source-exact values","source":1,"quote":"exact verbatim quote","requirement":"which requested part it answers"}}],"verbatim_values":["exact source spelling/capitalization/mark/value that must survive final writing"],"coverage":[{{"requirement":"requested part","status":"proved|partial|missing","sources":[1]}}],"gaps":["only genuinely unresolved facts"],"repair_queries":["high precision query for a gap"],"comparison_explanation":"source-supported reason for a discrepancy, or empty"}}\n\nDo not create a gap merely because you could add background detail. If all requested outputs are proved, gaps must be [].'''
     payload = await _chat(
         GRID_MODELS,
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
@@ -1637,6 +1845,7 @@ async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, d
     if data is None:
         data = fallback
     _augment_grid_table_count(data, qmap, book)
+    _sanitize_grid_conflicts(data, qmap, book)
     _retain_grid_quotes(data, book)
     return data
 
@@ -2522,6 +2731,7 @@ async def _solve(query: Query, question: str) -> Response:
     facts = _verified_facts(grid, book)
     clean_grid = _grid_for_writer(grid, facts)
     best_answer = _verified_fact_answer(question, facts, book)
+    protected_compiled = False
 
     # The evidence compiler is now an independent answer path, not merely a
     # no-facts emergency. V8 proved that one bad deterministic fact could suppress
@@ -2544,7 +2754,10 @@ async def _solve(query: Query, question: str) -> Response:
         try:
             compiled = await _compile_required_parts(qmap, plan, book, deadline)
             if compiled and _answer_part_coverage(compiled, qmap) == len(qmap.parts):
-                best_answer = compiled
+                compiled = _sanitize_answer_conflicts(compiled, qmap, book)
+                if not _answer_has_final_count_conflict(compiled, qmap, book):
+                    best_answer = compiled
+                    protected_compiled = bool(qmap.hard_source_lock)
         except Exception:
             pass
 
@@ -2555,7 +2768,7 @@ async def _solve(query: Query, question: str) -> Response:
         or _grid_has_real_gaps(grid)
         or (bool(qmap.parts) and _answer_part_coverage(best_answer, qmap) < len(qmap.parts))
     )
-    if needs_repair and _elapsed(started) < REPAIR_LATEST_ELAPSED:
+    if needs_repair and not protected_compiled and _elapsed(started) < REPAIR_LATEST_ELAPSED:
         repair = _repair_queries(grid)[:1]
         if repair:
             try:
@@ -2584,13 +2797,16 @@ async def _solve(query: Query, question: str) -> Response:
         try:
             compiled = await _compile_required_parts(qmap, plan, book, deadline)
             if compiled and _answer_part_coverage(compiled, qmap) == len(qmap.parts):
-                best_answer = compiled
+                compiled = _sanitize_answer_conflicts(compiled, qmap, book)
+                if not _answer_has_final_count_conflict(compiled, qmap, book):
+                    best_answer = compiled
+                    protected_compiled = protected_compiled or bool(qmap.hard_source_lock)
         except Exception:
             pass
 
     # Final synthesis is permitted only from quote-verified facts. Its output
     # must pass a deterministic grounding firewall or it is discarded.
-    if facts and _elapsed(started) < FORCE_COMMIT_ELAPSED:
+    if facts and not protected_compiled and _elapsed(started) < FORCE_COMMIT_ELAPSED:
         try:
             written = await _write_answer(qmap, plan, clean_grid, book, deadline)
             writer_grounded = _grounded_answer(written, question, facts, book) or _grounded_in_book(written, question, book)
@@ -2603,7 +2819,7 @@ async def _solve(query: Query, question: str) -> Response:
     # the same deterministic grounding firewall before it can replace the prior.
     current_grounded = _grounded_answer(best_answer, question, facts, book) if facts else False
     current_grounded = current_grounded or _grounded_in_book(best_answer, question, book)
-    if _elapsed(started) < REVIEW_LATEST_ELAPSED and current_grounded:
+    if not protected_compiled and _elapsed(started) < REVIEW_LATEST_ELAPSED and current_grounded:
         try:
             reviewed = await _review_answer(best_answer, qmap, plan, clean_grid, book, deadline)
             reviewed_grounded = (_grounded_answer(reviewed, question, facts, book) if facts else False) or _grounded_in_book(reviewed, question, book)
@@ -2625,12 +2841,28 @@ async def _solve(query: Query, question: str) -> Response:
         try:
             compiled = await _compile_required_parts(qmap, plan, book, deadline)
             if compiled:
-                best_answer = compiled
+                compiled = _sanitize_answer_conflicts(compiled, qmap, book)
+                if not _answer_has_final_count_conflict(compiled, qmap, book):
+                    best_answer = compiled
         except Exception:
             pass
 
+    best_answer = _sanitize_answer_conflicts(best_answer, qmap, book)
     best_answer = _restore_verbatim(best_answer, _grid_verbatim(grid))
+    best_answer = _sanitize_answer_conflicts(best_answer, qmap, book)
     best_answer = _normalize_markers(_clean_answer(best_answer), len(book.rows))
+
+    # Last deterministic invariant: a final-field count cannot contradict the
+    # section-scoped official result table.  If it somehow does, prefer a fresh
+    # coverage compilation rather than emitting mutually exclusive facts.
+    if _answer_has_final_count_conflict(best_answer, qmap, book) and qmap.parts and _left(deadline) > 8.0:
+        try:
+            repaired = await _compile_required_parts(qmap, plan, book, deadline)
+            repaired = _sanitize_answer_conflicts(repaired, qmap, book)
+            if repaired and not _answer_has_final_count_conflict(repaired, qmap, book):
+                best_answer = repaired
+        except Exception:
+            pass
 
     if not _usable_answer(best_answer, question):
         # Evidence excerpts are safer than model-memory invention.
