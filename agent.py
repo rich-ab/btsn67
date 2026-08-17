@@ -1,4 +1,4 @@
-"""Harnyx SN67 miner — 151 (Richjg).
+"""Harnyx SN67 miner — 151 (richjg).
 
 This candidate is built around a bounded evidence-compiler rather than a long
 conversational tool loop.  It is designed from a real local-eval failure where
@@ -45,7 +45,7 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "canonical-event-v12.0"
+VERSION = "stage-bound-v13.0"
 
 # ---------------------------------------------------------------------------
 # Runtime policy
@@ -87,10 +87,10 @@ SCHEMA_MODELS = (
 # A Harnyx evaluation can have a larger outer timeout, but this agent commits
 # well before it.  The v3 local run used ~251s and left too little finalization
 # margin; v4 targets materially less.
-WALL_SECONDS = 180.0
-REPAIR_LATEST_ELAPSED = 105.0
-REVIEW_LATEST_ELAPSED = 135.0
-FORCE_COMMIT_ELAPSED = 158.0
+WALL_SECONDS = 125.0
+REPAIR_LATEST_ELAPSED = 78.0
+REVIEW_LATEST_ELAPSED = 94.0
+FORCE_COMMIT_ELAPSED = 108.0
 
 PLAN_TIMEOUT = 10.0
 # Parallel is the primary retrieval provider. DeSearch is retained only as a
@@ -108,7 +108,7 @@ EMERGENCY_TIMEOUT = 36.0
 MAX_PLAN_QUERIES = 3
 MAX_REPAIR_QUERIES = 1
 SEARCH_RESULTS = 8
-FETCH_CAP = 4
+FETCH_CAP = 5
 SEARCH_CONCURRENCY = 5
 FETCH_CONCURRENCY = 5
 MAX_SOURCES = 42
@@ -1804,8 +1804,8 @@ def _record_from_entries(
 def _table_records_for_row(number: int, row: dict[str, Any]) -> list[dict[str, Any]]:
     """Return section-scoped table runs from one fetched/search source.
 
-    Important: never deduplicate all ROW labels across an entire page.  Result
-    pages may contain several numbered tables.  A restart (e.g. 14 -> 1) or a
+    Important: never deduplicate all ROW labels across an entire page. Result
+    pages may contain several numbered tables. A restart (e.g. 14 -> 1) or a
     section-role change closes the current run.
     """
     body = str(row.get("text") or "")
@@ -1819,31 +1819,32 @@ def _table_records_for_row(number: int, row: dict[str, Any]) -> list[dict[str, A
     offset = 0
     last_value = 0
 
-    def flush() -> None:
-        nonlocal entries, last_value
-        record = _record_from_entries(number, body, current, entries)
-        if record is not None:
-            records.append(record)
-        entries = []
-        last_value = 0
-
     for raw_line in body.splitlines(keepends=True):
         new_role = _section_role(raw_line, current, source_stage)
         if new_role != current:
-            flush()
+            record = _record_from_entries(number, body, current, entries)
+            if record is not None:
+                records.append(record)
+            entries = []
+            last_value = 0
             current = new_role
 
         value = _row_number_from_line(raw_line)
         if value > 0:
-            # Numbering restart means a new table even if the surrounding page
-            # did not expose a clean heading in extracted text.
             if entries and value <= last_value:
-                flush()
+                record = _record_from_entries(number, body, current, entries)
+                if record is not None:
+                    records.append(record)
+                entries = []
+                last_value = 0
             if current in {"final", "semifinal", "semifinal1", "semifinal2", "heat"}:
                 entries.append((value, offset, offset + len(raw_line)))
                 last_value = value
         offset += len(raw_line)
-    flush()
+
+    record = _record_from_entries(number, body, current, entries)
+    if record is not None:
+        records.append(record)
     return records
 
 
@@ -3012,7 +3013,7 @@ async def _emergency_answer(question: str, deadline: float) -> str:
 # ---------------------------------------------------------------------------
 
 
-async def _solve(query: Query, question: str) -> Response:
+async def _solve_legacy(query: Query, question: str) -> Response:
     started = monotonic()
     deadline = started + WALL_SECONDS
     try:
@@ -3217,6 +3218,670 @@ async def _solve(query: Query, question: str) -> Response:
         first = _CITE_RE.sub("", first)
         best_answer = _clean_space(first)
     return Response(text=best_answer, citations=refs or None)
+
+
+
+# ---------------------------------------------------------------------------
+# V13 stage-bound deterministic compiler
+# ---------------------------------------------------------------------------
+
+
+def _v13_clean_cell(value: str) -> str:
+    cell = (value or "").strip()
+    cell = cell.replace("\\.", ".")
+    cell = re.sub(r"\[(.*?)\]\([^)]*\)", r"\1", cell)
+    cell = re.sub(r"[*_`]+", "", cell)
+    return _clean_space(cell)
+
+
+def _v13_header_key(value: str) -> str:
+    key = _v13_clean_cell(value).lower()
+    key = re.sub(r"[^a-z0-9]+", "", key)
+    aliases = {
+        "place": "pos",
+        "position": "pos",
+        "pos": "pos",
+        "rank": "rank",
+        "heat": "heat",
+        "bib": "bib",
+        "athlete": "athlete",
+        "name": "athlete",
+        "mark": "mark",
+        "time": "mark",
+        "details": "details",
+        "detail": "details",
+        "notes": "details",
+        "note": "details",
+        "nat": "nation",
+        "country": "nation",
+        "nation": "nation",
+    }
+    return aliases.get(key, key)
+
+
+def _v13_cells(line: str) -> list[str]:
+    raw = (line or "").strip()
+    if not raw.startswith("|"):
+        return []
+    parts = raw.strip("|").split("|")
+    return [_v13_clean_cell(part) for part in parts]
+
+
+def _v13_is_separator(cells: list[str]) -> bool:
+    if not cells:
+        return False
+    seen = False
+    for cell in cells:
+        compact = re.sub(r"\s+", "", cell)
+        if not compact:
+            continue
+        seen = True
+        if not re.fullmatch(r":?-{2,}:?", compact):
+            return False
+    return seen
+
+
+def _v13_markdown_tables(body: str) -> list[dict[str, Any]]:
+    """Parse markdown result tables without mixing neighboring page sections."""
+    lines = (body or "").splitlines()
+    tables: list[dict[str, Any]] = []
+    idx = 0
+    while idx < len(lines):
+        headers = _v13_cells(lines[idx])
+        if len(headers) < 3 or idx + 1 >= len(lines):
+            idx += 1
+            continue
+        sep = _v13_cells(lines[idx + 1])
+        if not _v13_is_separator(sep):
+            idx += 1
+            continue
+
+        keys = [_v13_header_key(x) for x in headers]
+        rows: list[dict[str, Any]] = []
+        raw_rows: list[str] = []
+        j = idx + 2
+        while j < len(lines):
+            cells = _v13_cells(lines[j])
+            if not cells:
+                break
+            if _v13_is_separator(cells):
+                j += 1
+                continue
+            # Adjust for empty spacer columns in World Athletics tables.
+            if len(cells) < len(keys):
+                cells += [""] * (len(keys) - len(cells))
+            elif len(cells) > len(keys):
+                cells = cells[: len(keys) - 1] + [" ".join(cells[len(keys) - 1 :])]
+            row: dict[str, Any] = {"_raw": lines[j]}
+            for key, value in zip(keys, cells):
+                if not key:
+                    continue
+                # Preserve the first useful value when duplicate/blank headers occur.
+                if key not in row or not str(row.get(key) or "").strip():
+                    row[key] = value
+            pos_text = str(row.get("pos") or "").strip()
+            if pos_text:
+                m = re.match(r"(\d{1,3})", pos_text)
+                if m:
+                    row["_pos_int"] = _int(m.group(1), 0)
+            heat_text = str(row.get("heat") or "").strip()
+            if heat_text:
+                m = re.match(r"(\d{1,2})", heat_text)
+                if m:
+                    row["_heat_int"] = _int(m.group(1), 0)
+            rows.append(row)
+            raw_rows.append(lines[j])
+            j += 1
+
+        if rows:
+            tables.append(
+                {
+                    "headers": keys,
+                    "rows": rows,
+                    "raw_header": lines[idx],
+                    "raw_rows": raw_rows,
+                    "start": idx,
+                    "end": j,
+                }
+            )
+        idx = max(idx + 1, j)
+    return tables
+
+
+def _v13_table_quality(table: dict[str, Any], want_summary: bool = False) -> int:
+    headers = set(table.get("headers") or [])
+    rows = table.get("rows") or []
+    score = len(rows)
+    if "athlete" in headers:
+        score += 30
+    if "mark" in headers:
+        score += 20
+    if "pos" in headers:
+        score += 20
+    if "details" in headers:
+        score += 8
+    if want_summary and "heat" in headers:
+        score += 35
+    if want_summary and "rank" in headers:
+        score += 10
+    if not want_summary and "heat" in headers:
+        score -= 10
+    return score
+
+
+def _v13_best_result_table(body: str, want_summary: bool = False) -> dict[str, Any] | None:
+    candidates = _v13_markdown_tables(body)
+    if want_summary:
+        candidates = [
+            table for table in candidates
+            if "athlete" in set(table.get("headers") or [])
+            and "heat" in set(table.get("headers") or [])
+        ]
+    else:
+        candidates = [
+            table for table in candidates
+            if "athlete" in set(table.get("headers") or [])
+            and "pos" in set(table.get("headers") or [])
+            and "mark" in set(table.get("headers") or [])
+        ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda t: _v13_table_quality(t, want_summary), reverse=True)
+    return candidates[0]
+
+
+def _v13_stage_of_url(url: str) -> str:
+    low = (url or "").lower().split("?", 1)[0].rstrip("/")
+    if "/semi-final/summary" in low or "/semifinal/summary" in low:
+        return "semifinal_summary"
+    if "/semi-final/result" in low or "/semifinal/result" in low:
+        return "semifinal"
+    if "/final/result" in low and "semi" not in low:
+        return "final"
+    return ""
+
+
+def _v13_canonical_base(url: str) -> str:
+    target = (url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
+    replacements = (
+        ("/semi-final/results", "/semi-final/result"),
+        ("/semifinal/results", "/semi-final/result"),
+        ("/final/results", "/final/result"),
+        ("/semifinal/result", "/semi-final/result"),
+    )
+    for old, new in replacements:
+        if old in target:
+            target = target.replace(old, new, 1)
+    return target
+
+
+def _v13_stage_siblings(url: str) -> list[str]:
+    target = _v13_canonical_base(url)
+    out: list[str] = []
+    stage = _v13_stage_of_url(target)
+    if stage == "semifinal":
+        out.extend([
+            target,
+            target.replace("/semi-final/result", "/semi-final/summary", 1),
+            target.replace("/semi-final/result", "/final/result", 1),
+        ])
+    elif stage == "semifinal_summary":
+        out.extend([
+            target.replace("/semi-final/summary", "/semi-final/result", 1),
+            target,
+            target.replace("/semi-final/summary", "/final/result", 1),
+        ])
+    elif stage == "final":
+        out.extend([
+            target.replace("/final/result", "/semi-final/result", 1),
+            target.replace("/final/result", "/semi-final/summary", 1),
+            target,
+        ])
+    return list(dict.fromkeys([x for x in out if x]))
+
+
+async def _v13_ensure_stage_sources(book: SourceBook, deadline: float) -> None:
+    """Fetch the canonical result stages directly, bypassing relevance ranking."""
+    seeds: list[str] = []
+    for row in book.rows:
+        url = str(row.get("url") or "")
+        if _v13_stage_of_url(_v13_canonical_base(url)):
+            seeds.append(url)
+    for url in book.pinned_event_urls:
+        if _v13_stage_of_url(_v13_canonical_base(url)):
+            seeds.append(url)
+
+    wanted: list[str] = []
+    for seed in seeds:
+        for candidate in _v13_stage_siblings(seed):
+            if candidate not in wanted:
+                wanted.append(candidate)
+
+    # Prefer the stable non-/en/ World Athletics route when both variants exist.
+    wanted.sort(key=lambda u: ("/en/" in u, 0 if "/semi-final/summary" in u else 1, len(u)))
+    wanted = wanted[:6]
+    if not wanted:
+        return
+
+    existing = {str(row.get("url") or "").split("?", 1)[0].rstrip("/") for row in book.rows}
+    tasks = []
+    for url in wanted:
+        clean = url.split("?", 1)[0].rstrip("/")
+        if clean in existing:
+            continue
+        if _left(deadline) < 12.0:
+            break
+        tasks.append(asyncio.create_task(_fetch_one(url, book)))
+    if not tasks:
+        return
+    try:
+        done, pending = await asyncio.wait(
+            tasks,
+            timeout=min(36.0, max(10.0, _left(deadline) - 4.0)),
+        )
+        for task in pending:
+            task.cancel()
+        for task in done:
+            try:
+                task.result()
+            except Exception:
+                pass
+    except Exception:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+
+
+def _v13_registry(book: SourceBook) -> dict[str, dict[str, Any]]:
+    """Build typed stage slots from ALL admissible rows, never book.ranked()[:N]."""
+    registry: dict[str, dict[str, Any]] = {}
+    for number in range(1, len(book.rows) + 1):
+        row = book.row(number)
+        if row is None or not book.source_allowed(number):
+            continue
+        url = _v13_canonical_base(str(row.get("url") or ""))
+        stage = _v13_stage_of_url(url)
+        if not stage:
+            continue
+        body = str(row.get("text") or "")
+        if not body:
+            continue
+
+        if stage == "semifinal_summary":
+            table = _v13_best_result_table(body, want_summary=True)
+        else:
+            table = _v13_best_result_table(body, want_summary=False)
+        if table is None:
+            continue
+
+        # Canonical singular /result routes with populated result rows outrank
+        # light shell pages such as /en/.../final/results that contain only headers.
+        route_score = 100
+        if "/final/result" in url or "/semi-final/result" in url:
+            route_score += 70
+        if "/summary" in url:
+            route_score += 60
+        route_score += min(40, len(table.get("rows") or []))
+        route_score += max(0, _event_match_state(
+            book.qmap.question,
+            str(row.get("url") or ""),
+            str(row.get("title") or ""),
+            body[:5000],
+        )) * 15
+
+        candidate = {
+            "source": number,
+            "url": str(row.get("url") or ""),
+            "title": str(row.get("title") or ""),
+            "body": body,
+            "table": table,
+            "score": route_score,
+        }
+        old = registry.get(stage)
+        if old is None or _int(candidate.get("score"), 0) > _int(old.get("score"), 0):
+            registry[stage] = candidate
+    return registry
+
+
+def _v13_rule(stage: dict[str, Any] | None) -> tuple[str, int]:
+    if not stage:
+        return "", 0
+    body = str(stage.get("body") or "")
+    m = re.search(
+        r"First\s+(\d{1,2})\s+of\s+each\s+(?:heat|semi[- ]?final)\s+\(Q\)\s+qualify\s+to\s+Final",
+        body,
+        flags=re.I,
+    )
+    if not m:
+        return "", 0
+    start = body.rfind("\n", 0, m.start()) + 1
+    end = body.find("\n", m.end())
+    if end < 0:
+        end = len(body)
+    return body[start:end].strip(), _int(m.group(1), 0)
+
+
+def _v13_name(row: dict[str, Any]) -> str:
+    return _clean_space(str(row.get("athlete") or ""))
+
+
+def _v13_details(row: dict[str, Any]) -> str:
+    return _clean_space(str(row.get("details") or ""))
+
+
+def _v13_mark(row: dict[str, Any]) -> str:
+    return _clean_space(str(row.get("mark") or ""))
+
+
+def _v13_find_named_row(rows: list[dict[str, Any]], text: str) -> dict[str, Any] | None:
+    low = (text or "").lower()
+    matches = []
+    for row in rows:
+        name = _v13_name(row)
+        if not name:
+            continue
+        # Source names may use all-caps surnames while the question uses title case.
+        compact = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
+        words = [x for x in compact.split() if len(x) > 1]
+        if words and all(word in low for word in words):
+            matches.append(row)
+    if not matches:
+        return None
+    matches.sort(key=lambda r: len(_v13_name(r)), reverse=True)
+    return matches[0]
+
+
+def _v13_retain_line(book: SourceBook, source: int, raw_line: str) -> None:
+    if source <= 0 or not raw_line:
+        return
+    book.retain(source, raw_line.strip())
+
+
+def _v13_count_semifinal_heats(summary: dict[str, Any] | None, semifinal: dict[str, Any] | None) -> int:
+    if summary:
+        table = summary.get("table") or {}
+        heats = {
+            _int(row.get("_heat_int"), 0)
+            for row in table.get("rows") or []
+            if _int(row.get("_heat_int"), 0) > 0
+        }
+        if heats:
+            return len(heats)
+    if semifinal:
+        body = str(semifinal.get("body") or "")
+        found = set(_int(x, 0) for x in re.findall(r"\bHeat\s+(\d{1,2})\b", body, flags=re.I))
+        found.discard(0)
+        if found:
+            return len(found)
+    return 0
+
+
+def _v13_stage_bound_compiler(qmap: QuestionMap, book: SourceBook) -> str:
+    """Deterministically answer stage-bound result-table questions.
+
+    This compiler binds every requested fact to the stage that can prove it:
+    final facts can only come from FINAL; semifinal facts from SEMIFINAL; and
+    cross-stage ranking requires both. It never lets a semifinal row count fill
+    a final-count slot.
+    """
+    low = qmap.question.lower()
+    if not (
+        ("semi-final" in low or "semifinal" in low)
+        and re.search(r"\bfinal\b", low)
+        and ("result" in low or "results" in low)
+    ):
+        return ""
+
+    registry = _v13_registry(book)
+    final = registry.get("final")
+    semifinal = registry.get("semifinal")
+    summary = registry.get("semifinal_summary")
+    if not final or not semifinal:
+        return ""
+
+    final_rows = list((final.get("table") or {}).get("rows") or [])
+    semi_rows = list((semifinal.get("table") or {}).get("rows") or [])
+    if len(final_rows) < 4 or len(semi_rows) < 4:
+        return ""
+
+    final_source = _int(final.get("source"), 0)
+    semi_source = _int(semifinal.get("source"), 0)
+    summary_source = _int((summary or {}).get("source"), 0)
+
+    # Result tables must have a contiguous 1..N finishing-order run.
+    final_positions = [_int(row.get("_pos_int"), 0) for row in final_rows if _int(row.get("_pos_int"), 0) > 0]
+    if not final_positions:
+        return ""
+    unique_final_positions = []
+    for value in final_positions:
+        if value not in unique_final_positions:
+            unique_final_positions.append(value)
+    final_count = max(unique_final_positions)
+    if set(range(1, final_count + 1)) - set(unique_final_positions):
+        return ""
+
+    # Semifinal 1 winner: the fetched /semi-final/result page is Heat 1 in
+    # World Athletics, and generic result-table sites similarly expose one heat.
+    semi_ranked = [row for row in semi_rows if _int(row.get("_pos_int"), 0) > 0]
+    semi_ranked.sort(key=lambda r: _int(r.get("_pos_int"), 999))
+    semi_winner = next((row for row in semi_ranked if _int(row.get("_pos_int"), 0) == 1), None)
+    if semi_winner is None:
+        return ""
+
+    # Q pool is stage-bound to semifinal 1 only.
+    q_rows = []
+    for row in semi_ranked:
+        details = _v13_details(row)
+        if re.search(r"(?:^|\s)Q(?:\s|$)", details):
+            q_rows.append(row)
+    if len(q_rows) < 2:
+        # Some extracts omit the Details cell; use the printed rule's N as a
+        # deterministic fallback, but only within this semifinal result table.
+        _, n_auto = _v13_rule(semifinal)
+        if n_auto > 0:
+            q_rows = semi_ranked[:n_auto]
+    if not q_rows:
+        return ""
+
+    final_by_name: dict[str, dict[str, Any]] = {}
+    for row in final_rows:
+        name = _v13_name(row)
+        if name:
+            final_by_name[re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()] = row
+
+    # Determine the named athlete requested for the final-position subpart from
+    # the part text itself, then bind exclusively to the FINAL table.
+    named_final = None
+    named_part = ""
+    for part in qmap.parts:
+        part_low = part.lower()
+        if "finishing position" in part_low and "final" in part_low:
+            candidate = _v13_find_named_row(final_rows, part_low)
+            if candidate is not None:
+                named_final = candidate
+                named_part = part
+                break
+
+    # Cross-stage superlative: map only the semifinal-1 Q pool into FINAL.
+    compared: list[dict[str, Any]] = []
+    for qrow in q_rows:
+        qname = _v13_name(qrow)
+        key = re.sub(r"[^a-z0-9]+", " ", qname.lower()).strip()
+        frow = final_by_name.get(key)
+        if frow is not None and _int(frow.get("_pos_int"), 0) > 0:
+            compared.append(frow)
+    compared.sort(key=lambda r: _int(r.get("_pos_int"), 999))
+    best_q_final = compared[0] if compared else None
+
+    rule_line, auto_n = _v13_rule(summary or semifinal)
+    if not rule_line:
+        rule_line, auto_n = _v13_rule(semifinal)
+    heat_count = _v13_count_semifinal_heats(summary, semifinal)
+    implied = auto_n * heat_count if auto_n > 0 and heat_count > 0 else 0
+
+    # Explain extra advancement statuses only when the official semifinal summary
+    # provides them. This preserves the "using only official results" constraint.
+    extras: list[dict[str, Any]] = []
+    if summary:
+        summary_rows = list((summary.get("table") or {}).get("rows") or [])
+        for row in summary_rows:
+            detail = _v13_details(row)
+            if re.search(r"\bq[RJ]\b", detail, flags=re.I):
+                extras.append(row)
+
+    # Retain narrow exact proof lines for receipt-backed citations.
+    for row in final_rows:
+        if _int(row.get("_pos_int"), 0) in {1, final_count}:
+            _v13_retain_line(book, final_source, str(row.get("_raw") or ""))
+    _v13_retain_line(book, semi_source, str(semi_winner.get("_raw") or ""))
+    for row in q_rows:
+        _v13_retain_line(book, semi_source, str(row.get("_raw") or ""))
+    if named_final is not None:
+        _v13_retain_line(book, final_source, str(named_final.get("_raw") or ""))
+    if best_q_final is not None:
+        _v13_retain_line(book, final_source, str(best_q_final.get("_raw") or ""))
+    if rule_line:
+        book.retain(summary_source or semi_source, rule_line)
+    for row in extras:
+        _v13_retain_line(book, summary_source, str(row.get("_raw") or ""))
+
+    # Construct an answer that mirrors explicit numbered requirements when they
+    # are present. We do not use an LLM here: the source tables already prove it.
+    lines: list[str] = []
+    final_marker = f"[{final_source}]"
+    semi_marker = f"[{semi_source}]"
+    summary_marker = f"[{summary_source}]" if summary_source > 0 else semi_marker
+
+    if qmap.parts:
+        for index, part in enumerate(qmap.parts, 1):
+            plow = part.lower()
+            if ("how many" in plow or "number" in plow) and "final" in plow:
+                sentence = f"({index}) The official final result list contains **{final_count} athletes** {final_marker}."
+                if rule_line and implied:
+                    sentence += (
+                        f" The semifinal rule is **“{rule_line}”** {summary_marker}, which ordinarily accounts for "
+                        f"**{implied}** automatic-Q places; the official final therefore has **{final_count - implied}** "
+                        f"additional athlete{'s' if final_count - implied != 1 else ''} beyond that ordinary Q count."
+                    )
+                    if extras:
+                        descriptions = []
+                        for row in extras:
+                            name = _v13_name(row)
+                            detail = _v13_details(row)
+                            if name and detail:
+                                descriptions.append(f"**{name} ({detail})**")
+                        if descriptions:
+                            sentence += " The official semifinal summary identifies the additional advancement statuses as " + " and ".join(descriptions) + f" {summary_marker}."
+                lines.append(sentence)
+                continue
+
+            if "semi" in plow and ("finished first" in plow or "who actually finished first" in plow or "winner" in plow):
+                lines.append(
+                    f"({index}) **{_v13_name(semi_winner)}** finished first in semifinal 1 in **{_v13_mark(semi_winner)}** {semi_marker}."
+                )
+                continue
+
+            if ("among" in plow or "qualifier" in plow or "best" in plow) and "final" in plow and best_q_final is not None:
+                qnames = ", ".join(f"**{_v13_name(row)}**" for row in q_rows)
+                lines.append(
+                    f"({index}) The semifinal-1 Q qualifiers are {qnames} {semi_marker}. "
+                    f"Among them, **{_v13_name(best_q_final)}** had the best final placing: "
+                    f"**{_int(best_q_final.get('_pos_int'), 0)}{_ordinal_suffix(_int(best_q_final.get('_pos_int'), 0))} "
+                    f"in {_v13_mark(best_q_final)}** {final_marker}."
+                )
+                continue
+
+            if "finishing position" in plow and "final" in plow and named_final is not None:
+                lines.append(
+                    f"({index}) **{_v13_name(named_final)}** finished **{_int(named_final.get('_pos_int'), 0)}"
+                    f"{_ordinal_suffix(_int(named_final.get('_pos_int'), 0))}** in the final in **{_v13_mark(named_final)}** {final_marker}."
+                )
+                continue
+
+        if len(lines) == len(qmap.parts):
+            return "\n".join(lines)
+
+    # Generic fallback for a stage-comparison result question.
+    if named_final is not None and best_q_final is not None:
+        return (
+            f"The official final result list contains **{final_count} athletes** {final_marker}. "
+            f"**{_v13_name(semi_winner)}** won the relevant semifinal in **{_v13_mark(semi_winner)}** {semi_marker}. "
+            f"**{_v13_name(named_final)}** finished **{_int(named_final.get('_pos_int'), 0)}"
+            f"{_ordinal_suffix(_int(named_final.get('_pos_int'), 0))}** in **{_v13_mark(named_final)}** {final_marker}. "
+            f"Among the semifinal Q qualifiers, **{_v13_name(best_q_final)}** placed highest in the final, "
+            f"**{_int(best_q_final.get('_pos_int'), 0)}{_ordinal_suffix(_int(best_q_final.get('_pos_int'), 0))} "
+            f"in {_v13_mark(best_q_final)}** {final_marker}."
+        )
+    return ""
+
+
+def _ordinal_suffix(number: int) -> str:
+    n = abs(_int(number, 0))
+    if 10 <= n % 100 <= 20:
+        return "th"
+    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
+
+
+def _v13_fast_applicable(qmap: QuestionMap) -> bool:
+    low = qmap.question.lower()
+    return bool(
+        ("semi-final" in low or "semifinal" in low)
+        and re.search(r"\bfinal\b", low)
+        and ("result" in low or "results" in low)
+        and (qmap.parts or qmap.hard_source_lock)
+    )
+
+
+async def _solve(query: Query, question: str) -> Response:
+    """V13 controller: deterministic typed-stage path first; legacy only as fallback."""
+    qmap = QuestionMap(question, query.output_schema)
+    if _v13_fast_applicable(qmap):
+        started = monotonic()
+        deadline = started + 78.0
+        try:
+            await _load_tooling()
+        except Exception:
+            pass
+        try:
+            plan = await _make_plan(qmap, deadline)
+        except Exception:
+            plan = _fallback_plan(qmap)
+        book = SourceBook(qmap, plan)
+
+        try:
+            await _search_many(plan.queries, book, deadline)
+            book.infer_source_lock()
+        except Exception:
+            pass
+
+        # First fetch canonical candidates from discovery, then explicitly ensure
+        # FINAL, SEMIFINAL and SEMIFINAL SUMMARY stage slots. No ranking cutoff.
+        try:
+            await _fetch_many(_fetch_candidates(book, FETCH_CAP), book, deadline)
+            book.infer_source_lock()
+            await _v13_ensure_stage_sources(book, deadline)
+            book.infer_source_lock()
+        except Exception:
+            pass
+
+        answer = _v13_stage_bound_compiler(qmap, book)
+        answer = _normalize_markers(_clean_answer(answer), len(book.rows))
+        if _usable_answer(answer, question):
+            refs = _citations(answer, book)
+            if query.output_schema is not None:
+                try:
+                    output = await _structured(answer, question, query.output_schema, deadline)
+                except Exception:
+                    output = _coerce(answer, query.output_schema)
+                return Response(output=output, citations=refs or None)
+            if qmap.strict_output:
+                first = _CITE_RE.sub("", answer.splitlines()[0] if answer else "")
+                answer = _clean_space(first)
+            return Response(text=answer, citations=refs or None)
+
+    # Non-stage questions, or a stage question whose required canonical tables
+    # could not be proven, retain the mature general research path.
+    return await _solve_legacy(query, question)
 
 
 @entrypoint("query")
