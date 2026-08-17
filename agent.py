@@ -1,4 +1,4 @@
-"""Harnyx SN67 miner — GroundedProof v5.
+"""Harnyx SN67 miner — GroundedProof v6 .
 
 This candidate is built around a bounded evidence-compiler rather than a long
 conversational tool loop.  It is designed from a real local-eval failure where
@@ -38,7 +38,7 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "groundedproof-v5.0"
+VERSION = "groundedproof-v6.0"
 
 # ---------------------------------------------------------------------------
 # Runtime policy
@@ -78,24 +78,24 @@ SCHEMA_MODELS = (
 # A Harnyx evaluation can have a larger outer timeout, but this agent commits
 # well before it.  The v3 local run used ~251s and left too little finalization
 # margin; v4 targets materially less.
-WALL_SECONDS = 168.0
-REPAIR_LATEST_ELAPSED = 88.0
-REVIEW_LATEST_ELAPSED = 132.0
-FORCE_COMMIT_ELAPSED = 140.0
+WALL_SECONDS = 185.0
+REPAIR_LATEST_ELAPSED = 105.0
+REVIEW_LATEST_ELAPSED = 145.0
+FORCE_COMMIT_ELAPSED = 158.0
 
 PLAN_TIMEOUT = 10.0
-SEARCH_TIMEOUT = 13.0
-FETCH_TIMEOUT = 15.0
-GRID_TIMEOUT = 36.0
-WRITE_TIMEOUT = 30.0
-REVIEW_TIMEOUT = 18.0
+SEARCH_TIMEOUT = 34.0
+FETCH_TIMEOUT = 30.0
+GRID_TIMEOUT = 42.0
+WRITE_TIMEOUT = 35.0
+REVIEW_TIMEOUT = 22.0
 SCHEMA_TIMEOUT = 18.0
-EMERGENCY_TIMEOUT = 14.0
+EMERGENCY_TIMEOUT = 24.0
 
-MAX_PLAN_QUERIES = 4
+MAX_PLAN_QUERIES = 5
 MAX_REPAIR_QUERIES = 1
 SEARCH_RESULTS = 7
-FETCH_CAP = 4
+FETCH_CAP = 3
 SEARCH_CONCURRENCY = 5
 FETCH_CONCURRENCY = 5
 MAX_SOURCES = 42
@@ -378,41 +378,61 @@ def _llm_text(payload: Any) -> str:
 
 
 async def _load_tooling() -> None:
+    """Load current allowed model ids from tooling_info().response."""
     try:
         info = await tooling_info(timeout=8.0)
         _remember_budget(info)
+        response = getattr(info, "response", None)
+        if not isinstance(response, dict):
+            return
+        provider_models = response.get("allowed_llm_provider_models")
+        if not isinstance(provider_models, dict):
+            return
+        raw = provider_models.get(LLM_PROVIDER)
         found: list[str] = []
-        for attr in ("llm_models", "models", "allowed_models"):
-            value = getattr(info, attr, None)
-            if isinstance(value, (list, tuple)):
-                for item in value:
-                    if isinstance(item, str) and item not in found:
-                        found.append(item)
-                    elif isinstance(item, dict):
-                        name = item.get("model") or item.get("id") or item.get("name")
-                        if isinstance(name, str) and name not in found:
-                            found.append(name)
+        if isinstance(raw, (list, tuple)):
+            for item in raw:
+                if isinstance(item, str) and item.strip() and item.strip() not in found:
+                    found.append(item.strip())
+                elif isinstance(item, dict):
+                    name = item.get("model") or item.get("id") or item.get("name")
+                    if isinstance(name, str) and name.strip() and name.strip() not in found:
+                        found.append(name.strip())
         if found:
             _STATE["allowed_models"] = tuple(found)
     except Exception:
         return
 
 
+def _model_rank(model: str) -> tuple[int, int]:
+    low = model.lower()
+    hints = (
+        "qwen3.5-397",
+        "glm-5.2",
+        "deepseek-v3.2",
+        "kimi-k2",
+        "qwen3.6",
+        "gemma-4-31b",
+    )
+    for idx, hint in enumerate(hints):
+        if hint in low:
+            return (idx, -len(model))
+    return (50, -len(model))
+
+
 def _models(preferred: tuple[str, ...]) -> list[str]:
     live = _STATE.get("allowed_models")
-    if not isinstance(live, tuple) or not live:
-        return list(preferred)
-    allowed = set(x for x in live if isinstance(x, str))
-    chosen = [x for x in preferred if x in allowed]
-    if chosen:
-        return chosen
-    fallback: list[str] = []
-    for item in live:
-        if isinstance(item, str):
-            fallback.append(item)
-        if len(fallback) >= 3:
-            break
-    return fallback
+    if isinstance(live, tuple) and live:
+        allowed = [x for x in live if isinstance(x, str) and x]
+        exact = [x for x in preferred if x in allowed]
+        rest = [x for x in allowed if x not in exact]
+        rest.sort(key=_model_rank)
+        return (exact + rest)[:5]
+    out = ["google/gemma-4-31B-turbo-TEE"]
+    for item in preferred:
+        if item not in out:
+            out.append(item)
+    return out[:5]
 
 
 async def _chat(
@@ -425,19 +445,16 @@ async def _chat(
 ) -> Any:
     for model in _models(preferred):
         timeout = min(timeout_cap, _left(deadline) - 2.0)
-        if timeout <= 4.0:
+        if timeout <= 5.0:
             return None
         try:
-            payload = await asyncio.wait_for(
-                llm_chat(
-                    provider=LLM_PROVIDER,
-                    model=model,
-                    messages=messages,
-                    temperature=temperature,
-                    max_output_tokens=max_tokens,
-                    timeout=timeout,
-                ),
-                timeout=timeout + 1.0,
+            payload = await llm_chat(
+                provider=LLM_PROVIDER,
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_output_tokens=max_tokens,
+                timeout=timeout,
             )
             _remember_budget(payload)
             if _llm_text(payload).strip():
@@ -498,11 +515,15 @@ class QuestionMap:
             self.answer_kind = "list/set"
         elif self.superlative:
             self.answer_kind = "ranking/fact"
-        numbered = re.findall(r"(?:^|\s)\((\d+)\)\s*([^()]+?)(?=(?:\s\(\d+\)|$))", q)
-        for _, body in numbered:
-            item = _clean_space(body)
+        # Slice between numbered markers so embedded labels such as "(Q)" do
+        # not truncate or erase later sub-questions.
+        markers = list(re.finditer(r"(?:^|\s)\((\d+)\)\s*", q))
+        for idx, marker in enumerate(markers):
+            body_start = marker.end()
+            body_end = markers[idx + 1].start() if idx + 1 < len(markers) else len(q)
+            item = _clean_space(q[body_start:body_end])
             if item:
-                self.parts.append(item[:700])
+                self.parts.append(item[:900])
         if not self.parts and q.count("?") > 1:
             for item in q.split("?"):
                 item = _clean_space(item)
@@ -829,36 +850,13 @@ def _loosen(query: str) -> str:
     return _clean_space(value)
 
 
-async def _search_one(query: str, book: SourceBook) -> list[int]:
-    q = _clean_space(query)
-    if not q:
-        return []
-    if q not in book.searched:
-        book.searched.append(q)
-    attempts = [q]
-    loose = _loosen(q)
-    if loose and loose != q:
-        attempts.append(loose)
-    payload = None
-    for attempt in attempts[:2]:
-        try:
-            result = await search_web(
-                attempt,
-                provider=SEARCH_PROVIDER,
-                num=SEARCH_RESULTS,
-                timeout=SEARCH_TIMEOUT,
-            )
-            if getattr(result, "results", None):
-                payload = result
-                break
-        except Exception:
-            continue
+def _ingest_search(payload: Any, book: SourceBook) -> list[int]:
     if payload is None:
         return []
     _remember_budget(payload)
     receipt = str(getattr(payload, "receipt_id", "") or "")
     items = list(getattr(payload, "results", None) or [])
-    if not receipt:
+    if not receipt or not items:
         return []
     numbers: list[int] = []
     for item in items:
@@ -869,13 +867,8 @@ async def _search_one(query: str, book: SourceBook) -> list[int]:
         title = str(getattr(item, "title", None) or "")
         url = str(getattr(item, "url", None) or "")
         number = book.add(
-            receipt,
-            result_id,
-            note,
-            title,
-            url,
-            [(0, min(len(note), SEARCH_PREVIEW))],
-            "search",
+            receipt, result_id, note, title, url,
+            [(0, min(len(note), SEARCH_PREVIEW))], "search"
         )
         if number and number not in numbers:
             numbers.append(number)
@@ -883,30 +876,59 @@ async def _search_one(query: str, book: SourceBook) -> list[int]:
 
 
 async def _search_many(queries: list[str], book: SourceBook, deadline: float) -> list[int]:
+    """Batch retrieval first; sequential rescue second.
+
+    search_web natively accepts a sequence of queries. This avoids v5's short
+    task-cancellation window, which could leave the evidence book completely
+    empty while every provider exception was silently swallowed.
+    """
     unique: list[str] = []
-    for q in queries:
-        q = _clean_space(q)
+    for raw in queries:
+        q = _clean_space(raw)
         if q and q.lower() not in [x.lower() for x in unique]:
             unique.append(q)
         if len(unique) >= MAX_PLAN_QUERIES:
             break
-    tasks = [asyncio.create_task(_search_one(q, book)) for q in unique]
-    if not tasks:
+    if not unique:
         return []
-    timeout = min(SEARCH_TIMEOUT + 4.0, max(2.0, _left(deadline) - 2.0))
-    done, pending = await asyncio.wait(tasks, timeout=timeout)
-    for task in pending:
-        task.cancel()
+
+    timeout = min(SEARCH_TIMEOUT, max(8.0, _left(deadline) - 4.0))
+    try:
+        payload = await search_web(
+            unique,
+            provider=SEARCH_PROVIDER,
+            num=SEARCH_RESULTS,
+            timeout=timeout,
+        )
+        numbers = _ingest_search(payload, book)
+        if numbers:
+            for q in unique:
+                if q not in book.searched:
+                    book.searched.append(q)
+            return numbers
+    except Exception:
+        pass
+
     numbers: list[int] = []
-    for task in done:
+    for q in unique[:2]:
+        if _left(deadline) < 16.0:
+            break
         try:
-            result = task.result()
-        except Exception:
-            result = []
-        if isinstance(result, list):
-            for number in result:
-                if isinstance(number, int) and number > 0 and number not in numbers:
+            payload = await search_web(
+                q,
+                provider=SEARCH_PROVIDER,
+                num=SEARCH_RESULTS,
+                timeout=min(24.0, max(8.0, _left(deadline) - 3.0)),
+            )
+            if q not in book.searched:
+                book.searched.append(q)
+            for number in _ingest_search(payload, book):
+                if number not in numbers:
                     numbers.append(number)
+            if numbers:
+                break
+        except Exception:
+            continue
     return numbers
 
 
@@ -981,18 +1003,24 @@ async def _fetch_many(urls: list[str], book: SourceBook, deadline: float) -> Non
             unique.append(url)
         if len(unique) >= FETCH_CAP:
             break
-    tasks = [asyncio.create_task(_fetch_one(url, book)) for url in unique]
-    if not tasks:
+    if not unique or _left(deadline) < 12.0:
         return
-    timeout = min(FETCH_TIMEOUT + 5.0, max(2.0, _left(deadline) - 2.0))
-    done, pending = await asyncio.wait(tasks, timeout=timeout)
-    for task in pending:
-        task.cancel()
-    for task in done:
-        try:
-            task.result()
-        except Exception:
-            pass
+    tasks = [asyncio.create_task(_fetch_one(url, book)) for url in unique]
+    try:
+        timeout = min(FETCH_TIMEOUT + 3.0, max(10.0, _left(deadline) - 3.0))
+        done, pending = await asyncio.wait(tasks, timeout=timeout)
+        for task in pending:
+            task.cancel()
+        for task in done:
+            try:
+                task.result()
+            except Exception:
+                pass
+    except Exception:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        return
 
 
 # ---------------------------------------------------------------------------
@@ -1089,6 +1117,31 @@ _COMMON_NAME_PHRASES = {
 }
 
 
+def _norm_quote(text: str) -> str:
+    value = (text or "").replace("\u00a0", " ")
+    value = value.replace("–", "-").replace("—", "-")
+    return _clean_space(value).lower()
+
+
+def _quote_supported(quote: str, body: str) -> bool:
+    if not quote or not body:
+        return False
+    if quote in body or quote.lower() in body.lower():
+        return True
+    nq = _norm_quote(quote)
+    nb = _norm_quote(body)
+    if len(nq) >= 6 and nq in nb:
+        return True
+    words = nq.split()
+    for width in (12, 10, 8):
+        if len(words) < width:
+            continue
+        for i in range(0, len(words) - width + 1):
+            if " ".join(words[i:i + width]) in nb:
+                return True
+    return False
+
+
 def _verified_facts(grid: dict[str, Any], book: SourceBook) -> list[dict[str, Any]]:
     """Keep only facts whose quoted evidence literally exists in the cited source."""
     raw = grid.get("facts")
@@ -1105,7 +1158,7 @@ def _verified_facts(grid: dict[str, Any], book: SourceBook) -> list[dict[str, An
         if row is None or not claim or len(quote) < 6:
             continue
         body = str(row.get("text") or "")
-        if quote not in body and quote.lower() not in body.lower():
+        if not _quote_supported(quote, body):
             continue
         clean = dict(item)
         clean["source"] = source
@@ -1608,6 +1661,31 @@ async def _structured(answer: str, question: str, schema: Any, deadline: float) 
     return fallback
 
 
+async def _direct_evidence_answer(question: str, book: SourceBook, deadline: float) -> str:
+    evidence = book.pack(min(MAX_PACK_CHARS, 52_000))
+    if not evidence or _left(deadline) < 12.0:
+        return ""
+    system = (
+        "Answer using ONLY the supplied numbered evidence. Answer every requested "
+        "sub-question in order. Preserve source spelling, capitalization, marks, "
+        "times, dates, units, labels and status codes exactly. Explain count/rule "
+        "discrepancies when the evidence shows the reason. Cite each load-bearing "
+        "claim with [source-number]. Never introduce a precise value or proper name "
+        "that is absent from the evidence."
+    )
+    user = f"QUESTION:\n{question}\n\nEVIDENCE:\n{evidence}"
+    payload = await _chat(
+        WRITE_MODELS,
+        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        deadline,
+        4200,
+        min(WRITE_TIMEOUT, max(8.0, _left(deadline) - 2.0)),
+        0.0,
+    )
+    answer = _clean_answer(_llm_text(payload))
+    return answer if _usable_answer(answer, question) else ""
+
+
 # ---------------------------------------------------------------------------
 # Emergency answer — never echo the prompt
 # ---------------------------------------------------------------------------
@@ -1668,7 +1746,7 @@ async def _solve(query: Query, question: str) -> Response:
         pass
 
     # Build one central grid and immediately discard any fact whose cited quote
-    # cannot be found literally in the source. This is the v5 grounding wall.
+    # cannot be found literally in the source. This is the v6 grounding wall.
     try:
         grid = await _build_grid(qmap, plan, book, deadline)
     except Exception:
@@ -1676,6 +1754,13 @@ async def _solve(query: Query, question: str) -> Response:
     facts = _verified_facts(grid, book)
     clean_grid = _grid_for_writer(grid, facts)
     best_answer = _verified_fact_answer(question, facts, book)
+    if not facts and book.rows:
+        try:
+            direct = await _direct_evidence_answer(question, book, deadline)
+            if _usable_answer(direct, question):
+                best_answer = direct
+        except Exception:
+            pass
 
     # A single targeted repair is allowed only when too little quote-verified
     # evidence survived. Do not spend another full wave merely to polish style.
