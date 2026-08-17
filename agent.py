@@ -1,4 +1,4 @@
-"""Harnyx SN67 miner — GroundedProof v6 .
+"""Harnyx SN67 miner 151 (richjg) — GroundedProof v7.
 
 This candidate is built around a bounded evidence-compiler rather than a long
 conversational tool loop.  It is designed from a real local-eval failure where
@@ -38,7 +38,7 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "groundedproof-v6.0"
+VERSION = "groundedproof-v7.0"
 
 # ---------------------------------------------------------------------------
 # Runtime policy
@@ -48,53 +48,57 @@ LLM_PROVIDER = "chutes"
 SEARCH_PROVIDER = "desearch"
 
 PLAN_MODELS = (
-    "Qwen/Qwen3.6-27B-TEE",
-    "zai-org/GLM-5.2-TEE",
+    "google/gemma-4-31B-turbo-TEE",
     "deepseek-ai/DeepSeek-V3.2-TEE",
-    "Qwen/Qwen3.5-397B-A17B-TEE",
+    "Qwen/Qwen3.6-27B-TEE",
 )
 GRID_MODELS = (
-    "Qwen/Qwen3.5-397B-A17B-TEE",
     "deepseek-ai/DeepSeek-V3.2-TEE",
-    "zai-org/GLM-5.2-TEE",
+    "google/gemma-4-31B-turbo-TEE",
     "Qwen/Qwen3.6-27B-TEE",
+    "Qwen/Qwen3.5-397B-A17B-TEE",
+    "moonshotai/Kimi-K2.6-TEE",
 )
 WRITE_MODELS = (
-    "Qwen/Qwen3.5-397B-A17B-TEE",
     "deepseek-ai/DeepSeek-V3.2-TEE",
-    "zai-org/GLM-5.2-TEE",
+    "google/gemma-4-31B-turbo-TEE",
+    "Qwen/Qwen3.6-27B-TEE",
+    "Qwen/Qwen3.5-397B-A17B-TEE",
 )
 REVIEW_MODELS = (
-    "Qwen/Qwen3.6-27B-TEE",
-    "zai-org/GLM-5.2-TEE",
+    "google/gemma-4-31B-turbo-TEE",
     "deepseek-ai/DeepSeek-V3.2-TEE",
+    "Qwen/Qwen3.6-27B-TEE",
 )
 SCHEMA_MODELS = (
-    "Qwen/Qwen3.6-27B-TEE",
-    "zai-org/GLM-5.2-TEE",
+    "google/gemma-4-31B-turbo-TEE",
     "deepseek-ai/DeepSeek-V3.2-TEE",
+    "Qwen/Qwen3.6-27B-TEE",
 )
 
 # A Harnyx evaluation can have a larger outer timeout, but this agent commits
 # well before it.  The v3 local run used ~251s and left too little finalization
 # margin; v4 targets materially less.
-WALL_SECONDS = 185.0
-REPAIR_LATEST_ELAPSED = 105.0
-REVIEW_LATEST_ELAPSED = 145.0
-FORCE_COMMIT_ELAPSED = 158.0
+WALL_SECONDS = 215.0
+REPAIR_LATEST_ELAPSED = 135.0
+REVIEW_LATEST_ELAPSED = 170.0
+FORCE_COMMIT_ELAPSED = 192.0
 
 PLAN_TIMEOUT = 10.0
-SEARCH_TIMEOUT = 34.0
-FETCH_TIMEOUT = 30.0
-GRID_TIMEOUT = 42.0
-WRITE_TIMEOUT = 35.0
-REVIEW_TIMEOUT = 22.0
-SCHEMA_TIMEOUT = 18.0
-EMERGENCY_TIMEOUT = 24.0
+# DeSearch was observed returning HTTP 200 only after ~31 seconds in local eval.
+# Give the provider enough time to finish its body instead of killing a healthy call.
+SEARCH_TIMEOUT = 72.0
+SEARCH_RETRY_TIMEOUT = 52.0
+FETCH_TIMEOUT = 55.0
+GRID_TIMEOUT = 48.0
+WRITE_TIMEOUT = 44.0
+REVIEW_TIMEOUT = 28.0
+SCHEMA_TIMEOUT = 22.0
+EMERGENCY_TIMEOUT = 45.0
 
-MAX_PLAN_QUERIES = 5
+MAX_PLAN_QUERIES = 2
 MAX_REPAIR_QUERIES = 1
-SEARCH_RESULTS = 7
+SEARCH_RESULTS = 9
 FETCH_CAP = 3
 SEARCH_CONCURRENCY = 5
 FETCH_CONCURRENCY = 5
@@ -253,6 +257,8 @@ def _token_terms(text: str) -> list[str]:
         "by", "with", "from", "as", "is", "are", "was", "were", "be", "been",
         "that", "this", "these", "those", "which", "what", "who", "when", "where",
         "how", "using", "only", "official", "result", "results", "page", "pages",
+        "commentary", "claims", "claim", "answer", "plain", "prose", "check",
+        "against", "usual", "exactly", "given", "shown", "printed", "requested",
     }
     out: list[str] = []
     seen: set[str] = set()
@@ -407,12 +413,12 @@ async def _load_tooling() -> None:
 def _model_rank(model: str) -> tuple[int, int]:
     low = model.lower()
     hints = (
-        "qwen3.5-397",
-        "glm-5.2",
         "deepseek-v3.2",
-        "kimi-k2",
-        "qwen3.6",
         "gemma-4-31b",
+        "qwen3.6",
+        "qwen3.5-397",
+        "kimi-k2",
+        "glm-5.2",
     )
     for idx, hint in enumerate(hints):
         if hint in low:
@@ -443,8 +449,16 @@ async def _chat(
     timeout_cap: float,
     temperature: float = 0.0,
 ) -> Any:
-    for model in _models(preferred):
-        timeout = min(timeout_cap, _left(deadline) - 2.0)
+    models = _models(preferred)
+    for idx, model in enumerate(models):
+        # The first route gets the full allowance. Later fallbacks are shorter so
+        # a 503/slow chute cannot consume the entire task wall clock.
+        attempt_cap = timeout_cap
+        if idx == 1:
+            attempt_cap = min(timeout_cap, 34.0)
+        elif idx >= 2:
+            attempt_cap = min(timeout_cap, 28.0)
+        timeout = min(attempt_cap, _left(deadline) - 2.0)
         if timeout <= 5.0:
             return None
         try:
@@ -599,51 +613,133 @@ class ResearchPlan:
         )
 
 
+def _query_prefix(question: str) -> str:
+    """Return the source/event clause, not the potentially false commentary claim."""
+    q = _clean_space(question)
+    if not q:
+        return ""
+    prefix = q.split(":", 1)[0] if ":" in q else q
+    prefix = re.sub(r"^(?:using|based on|according to)\s+(?:only\s+)?(?:the\s+)?", "", prefix, flags=re.I)
+    prefix = re.sub(r"\s+", " ", prefix).strip(" ,.;:-")
+    if len(prefix) > 240:
+        prefix = " ".join(prefix.split()[:28])
+    return prefix
+
+
+def _compact_queries(qmap: QuestionMap) -> list[str]:
+    """Build at most two high-signal searches without copying false claims.
+
+    Many benchmark prompts have `source/event context: claim + questions`. Searching
+    the whole prompt contaminates retrieval with the false claim and makes DeSearch's
+    OR query slow. v7 searches the source/event anchor first and only then a compact
+    entity/topic variant when needed.
+    """
+    q = qmap.question
+    low = q.lower()
+    source = qmap.named_sources[0] if qmap.named_sources else ""
+    prefix = _query_prefix(q)
+
+    signal_words: list[str] = []
+    for word in (
+        "semifinal", "semi-final", "final", "qualifying", "qualification",
+        "standings", "ranking", "schedule", "score", "results", "table",
+        "report", "filing", "statistics", "record", "records",
+    ):
+        if word in low and word not in signal_words:
+            signal_words.append(word)
+
+    years = re.findall(r"\b(?:19|20)\d{2}\b", q)
+    years = list(dict.fromkeys(years))[:2]
+
+    # Pick a compact named entity that is not merely the named source/event brand.
+    entity = ""
+    for item in qmap.entities:
+        cleaned = _clean_space(item)
+        if not cleaned or len(cleaned.split()) > 4:
+            continue
+        if source and cleaned.lower() in source.lower():
+            continue
+        if "championship" in cleaned.lower() and len(cleaned.split()) > 2:
+            continue
+        entity = cleaned
+        break
+
+    q1_parts: list[str] = []
+    if source and source.lower() not in prefix.lower():
+        q1_parts.append(source)
+    if prefix:
+        q1_parts.append(prefix)
+    if signal_words:
+        q1_parts.extend(signal_words[:4])
+    q1 = _clean_space(" ".join(q1_parts))
+
+    # Second query is deliberately shorter and avoids verbs/assertions from the prompt.
+    topic_terms = []
+    source_words = {x.lower() for x in _token_terms(source)}
+    for term in _token_terms(prefix + " " + q):
+        key = term.lower()
+        if key in source_words:
+            continue
+        if key in {"commentary", "claims", "claim", "won", "winner", "usual", "exactly"}:
+            continue
+        if term not in topic_terms:
+            topic_terms.append(term)
+        if len(topic_terms) >= 8:
+            break
+    q2_parts = [source] if source else []
+    q2_parts.extend(years)
+    q2_parts.extend(topic_terms[:6])
+    if entity and entity.lower() not in " ".join(q2_parts).lower():
+        q2_parts.append(entity)
+    q2_parts.extend(signal_words[:3])
+    q2_parts.append("results")
+    q2_words: list[str] = []
+    q2_seen: set[str] = set()
+    for piece in q2_parts:
+        for word in piece.split():
+            key = word.lower()
+            if key in q2_seen:
+                continue
+            q2_seen.add(key)
+            q2_words.append(word)
+    q2 = _clean_space(" ".join(q2_words))
+
+    out: list[str] = []
+    for candidate in (q1, q2):
+        candidate = _cap(candidate, 240)
+        if candidate and candidate.lower() not in [x.lower() for x in out]:
+            out.append(candidate)
+        if len(out) >= MAX_PLAN_QUERIES:
+            break
+    if not out:
+        out.append(_cap(_clean_space(q), 220))
+    return out
+
+
 def _fallback_plan(qmap: QuestionMap) -> ResearchPlan:
     plan = ResearchPlan()
     q = qmap.question
     plan.must_answer = list(qmap.parts) if qmap.parts else [q[:700]]
-    terms = _token_terms(q)
-    plan.focus_terms = terms[:16]
-    queries: list[str] = [q]
-    if qmap.named_sources:
-        for source in qmap.named_sources[:2]:
-            queries.append(f'{source} {" ".join(terms[:8])}')
-    queries.append(f'{" ".join(terms[:12])} official results')
-    if qmap.complete_set or qmap.superlative:
-        queries.append(f'{" ".join(terms[:10])} full results table')
-    plan.queries = _uniq_text(queries, MAX_PLAN_QUERIES, 430)
+    raw_focus = _token_terms(_query_prefix(q) + " " + q)
+    plan.focus_terms = [
+        term for term in raw_focus
+        if term.lower() not in {"won", "winner", "claims", "claim", "commentary", "usual"}
+    ][:16]
+    plan.queries = _compact_queries(qmap)
     if qmap.explain_difference:
-        plan.must_explain.append("Explain the observed discrepancy, including any extra categories/rows/statuses if the source shows them.")
+        plan.must_explain.append(
+            "Explain the observed discrepancy from actual source rows/statuses; do not infer the answer from the rule alone."
+        )
     if qmap.must_preserve_exact:
-        plan.exact_values_needed.append("All requested names, marks, labels, dates and units exactly as the official source prints them.")
+        plan.exact_values_needed.append(
+            "All requested names, marks, labels, dates and units exactly as the official source prints them."
+        )
     return plan
 
 
 async def _make_plan(qmap: QuestionMap, deadline: float) -> ResearchPlan:
-    """Deterministic retrieval plan.
-
-    v4 spent an LLM call planning queries even when the question already named
-    the event/source precisely. v5 deliberately avoids that latency and removes
-    a chance for the planner to substitute a remembered event/year.
-    """
-    plan = _fallback_plan(qmap)
-    q = qmap.question
-    terms = _token_terms(q)
-
-    # Prefer queries that preserve named source/event/year tokens verbatim.
-    extras: list[str] = []
-    if qmap.named_sources:
-        source = qmap.named_sources[0]
-        extras.append(f'{source} {" ".join(terms[:14])}')
-    if qmap.entities:
-        extras.append(f'{" ".join(qmap.entities[:3])} {" ".join(terms[:10])} official')
-    if qmap.complete_set or qmap.superlative or qmap.computed:
-        extras.append(f'{" ".join(terms[:14])} official full results table')
-
-    merged = extras + plan.queries
-    plan.queries = _uniq_text(merged, MAX_PLAN_QUERIES, 430)
-    return plan
+    # Deterministic by design: avoid an extra LLM hop and avoid search-query drift.
+    return _fallback_plan(qmap)
 
 
 # ---------------------------------------------------------------------------
@@ -876,11 +972,11 @@ def _ingest_search(payload: Any, book: SourceBook) -> list[int]:
 
 
 async def _search_many(queries: list[str], book: SourceBook, deadline: float) -> list[int]:
-    """Batch retrieval first; sequential rescue second.
+    """Run one concise DeSearch query at a time with realistic provider deadlines.
 
-    search_web natively accepts a sequence of queries. This avoids v5's short
-    task-cancellation window, which could leave the evidence book completely
-    empty while every provider exception was silently swallowed.
+    In local eval, DeSearch returned HTTP 200 after ~31 seconds but v6 killed the
+    request at 34 seconds before the body completed. v7 gives the first concise
+    query a 72-second envelope and avoids combining five variants into one OR query.
     """
     unique: list[str] = []
     for raw in queries:
@@ -892,44 +988,37 @@ async def _search_many(queries: list[str], book: SourceBook, deadline: float) ->
     if not unique:
         return []
 
-    timeout = min(SEARCH_TIMEOUT, max(8.0, _left(deadline) - 4.0))
-    try:
-        payload = await search_web(
-            unique,
-            provider=SEARCH_PROVIDER,
-            num=SEARCH_RESULTS,
-            timeout=timeout,
-        )
-        numbers = _ingest_search(payload, book)
-        if numbers:
-            for q in unique:
-                if q not in book.searched:
-                    book.searched.append(q)
-            return numbers
-    except Exception:
-        pass
-
-    numbers: list[int] = []
-    for q in unique[:2]:
-        if _left(deadline) < 16.0:
+    collected: list[int] = []
+    for idx, q in enumerate(unique[:2]):
+        if _left(deadline) < 24.0:
             break
+        cap = SEARCH_TIMEOUT if idx == 0 else SEARCH_RETRY_TIMEOUT
+        timeout = min(cap, max(12.0, _left(deadline) - 6.0))
         try:
             payload = await search_web(
                 q,
                 provider=SEARCH_PROVIDER,
                 num=SEARCH_RESULTS,
-                timeout=min(24.0, max(8.0, _left(deadline) - 3.0)),
+                timeout=timeout,
             )
             if q not in book.searched:
                 book.searched.append(q)
-            for number in _ingest_search(payload, book):
-                if number not in numbers:
-                    numbers.append(number)
+            numbers = _ingest_search(payload, book)
+            for number in numbers:
+                if number not in collected:
+                    collected.append(number)
             if numbers:
-                break
+                strongest = max(
+                    (_int((book.row(number) or {}).get("authority"), 0) for number in numbers),
+                    default=0,
+                )
+                # One successful authoritative result set is enough; fetch_page will
+                # provide deeper evidence. Only spend a second search on weak results.
+                if strongest >= 10 or len(numbers) >= 4:
+                    break
         except Exception:
             continue
-    return numbers
+    return collected
 
 
 def _fetch_candidates(book: SourceBook, cap: int) -> list[str]:
@@ -1007,7 +1096,7 @@ async def _fetch_many(urls: list[str], book: SourceBook, deadline: float) -> Non
         return
     tasks = [asyncio.create_task(_fetch_one(url, book)) for url in unique]
     try:
-        timeout = min(FETCH_TIMEOUT + 3.0, max(10.0, _left(deadline) - 3.0))
+        timeout = min(FETCH_TIMEOUT + 8.0, max(14.0, _left(deadline) - 5.0))
         done, pending = await asyncio.wait(tasks, timeout=timeout)
         for task in pending:
             task.cancel()
@@ -1060,12 +1149,15 @@ async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, d
         return fallback
     system = (
         "You are a CLOSED-BOOK evidence adjudicator. The supplied evidence is the entire world you may use. "
+        "Treat every assertion inside the QUESTION as an untrusted claim to test, never as evidence. "
         "Never answer from memory, even when you recognize the event/person/topic. Every load-bearing fact must "
         "identify a source number AND an exact verbatim quote copied from that source. If a value/name/time is "
         "not present in the supplied evidence, mark it missing instead of guessing. Preserve names, capitalization, "
         "marks, units, dates, labels and status codes exactly as printed. Check every sub-question. For computed "
-        "facts such as a row count, cite the exact table/source region used for the computation and state the "
-        "derivation in the claim. If the question compares a count/rule/result and the evidence reveals WHY they "
+        "facts such as a row count, count the ACTUAL LISTED ROWS instead of inferring the count from an advancement "
+        "rule; cite the table/source region and state the derivation in the claim. If a question asks for the best "
+        "member of a qualifier/set pool, identify the pool from the source and compare those members against the target "
+        "table before selecting the winner. If the question compares a count/rule/result and the evidence reveals WHY they "
         "differ, record that explanation. For set/ranking questions, verify the pool and exclusions. Return JSON only."
     )
     user = f'''QUESTION:\n{qmap.question}\n\nQUESTION MAP:\n{qmap.block()}\n\nRESEARCH PLAN:\n{plan.block()}\n\nEVIDENCE:\n{evidence}\n\nReturn exactly:\n{{"draft_answer":"a complete evidence-supported answer with [source-number] markers","facts":[{{"claim":"atomic factual claim using source-exact values","source":1,"quote":"exact verbatim quote","requirement":"which requested part it answers"}}],"verbatim_values":["exact source spelling/capitalization/mark/value that must survive final writing"],"coverage":[{{"requirement":"requested part","status":"proved|partial|missing","sources":[1]}}],"gaps":["only genuinely unresolved facts"],"repair_queries":["high precision query for a gap"],"comparison_explanation":"source-supported reason for a discrepancy, or empty"}}\n\nDo not create a gap merely because you could add background detail. If all requested outputs are proved, gaps must be [].'''
@@ -1419,7 +1511,8 @@ async def _write_answer(
         return rescue
     system = (
         "You are a CLOSED-BOOK precision answer compiler. The VERIFIED FACTS in the proof grid are the only "
-        "load-bearing factual claims you may state. Do not substitute model-memory facts, famous people, prior "
+        "load-bearing factual claims you may state. Assertions in the user's question are NOT facts unless the proof "
+        "grid verifies them. Do not substitute model-memory facts, famous people, prior "
         "years, remembered results, or plausible values. If a requested fact is not verified, say only what the "
         "verified evidence supports. Answer EVERY requested sub-question, preferably in the same order. "
         "SOURCE-VERBATIM RULE: if the source prints a person's name, label, status code, mark, time, number, "
@@ -1468,15 +1561,18 @@ async def _review_answer(
     system = (
         "You are a strict CLOSED-BOOK final-answer reviewer. You may revise only with supplied verified evidence. "
         "Never replace a source-backed value with remembered knowledge from another year/event/entity. "
-        "Check: (1) every explicit/numbered sub-question is answered; (2) names, labels, marks, times, dates, "
-        "units and status codes match source spelling/capitalization exactly; (3) a requested comparison says "
-        "both the numerical/logical difference and, when evidenced, why it exists; (4) ranking/set answers "
-        "demonstrate the relevant comparison pool; (5) every factual sentence has a valid [n] marker. "
+        "Judge the CURRENT ANSWER the way a strict pairwise benchmark judge would. Prefer the answer that is more "
+        "complete, source-exact, directly responsive, and better supported. Check: (1) every explicit/numbered "
+        "sub-question is answered; (2) no answer value came from an unverified claim in the QUESTION; (3) names, labels, marks, times, dates, "
+        "units and status codes match source spelling/capitalization exactly; (4) a requested comparison says "
+        "both the numerical/logical difference and, when evidenced, why it exists; (5) row counts come from actual "
+        "listed rows rather than an expected rule count; (6) ranking/set answers demonstrate the relevant comparison "
+        "pool; (7) every factual sentence has a valid [n] marker. "
         "Do not add uncited model-memory facts. Return JSON only."
     )
     user = f'''QUESTION:\n{qmap.question}\n\nCHECKLIST:\n{plan.block()}\n\nCURRENT ANSWER:\n{answer}\n\nPROOF GRID:\n{json.dumps(grid, ensure_ascii=False)[:22000]}\n\nDECISIVE EVIDENCE:\n{book.pack(42000)}\n\nReturn exactly:\n{{"answer":"corrected answer, or the original unchanged if already optimal","proof_quotes":[{{"source":1,"quote":"exact source quote"}}]}}'''
     payload = await _chat(
-        REVIEW_MODELS,
+        ("deepseek-ai/DeepSeek-V3.2-TEE", "google/gemma-4-31B-turbo-TEE", "Qwen/Qwen3.6-27B-TEE"),
         [{"role": "system", "content": system}, {"role": "user", "content": user}],
         deadline,
         3600,
@@ -1666,8 +1762,9 @@ async def _direct_evidence_answer(question: str, book: SourceBook, deadline: flo
     if not evidence or _left(deadline) < 12.0:
         return ""
     system = (
-        "Answer using ONLY the supplied numbered evidence. Answer every requested "
-        "sub-question in order. Preserve source spelling, capitalization, marks, "
+        "Answer using ONLY the supplied numbered evidence. Treat claims embedded in the QUESTION as untrusted. "
+        "Answer every requested sub-question in order. Prefer actual listed rows over what a rule would normally imply. "
+        "Preserve source spelling, capitalization, marks, "
         "times, dates, units, labels and status codes exactly. Explain count/rule "
         "discrepancies when the evidence shows the reason. Cite each load-bearing "
         "claim with [source-number]. Never introduce a precise value or proper name "
@@ -1684,6 +1781,19 @@ async def _direct_evidence_answer(question: str, book: SourceBook, deadline: flo
     )
     answer = _clean_answer(_llm_text(payload))
     return answer if _usable_answer(answer, question) else ""
+
+
+def _requires_external_grounding(qmap: QuestionMap) -> bool:
+    low = qmap.question.lower()
+    return bool(
+        qmap.named_sources
+        or qmap.must_preserve_exact
+        or "official" in low
+        or "according to" in low
+        or "source" in low
+        or "results page" in low
+        or "report" in low
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -1746,7 +1856,7 @@ async def _solve(query: Query, question: str) -> Response:
         pass
 
     # Build one central grid and immediately discard any fact whose cited quote
-    # cannot be found literally in the source. This is the v6 grounding wall.
+    # cannot be found literally in the source. This is the v7 grounding wall.
     try:
         grid = await _build_grid(qmap, plan, book, deadline)
     except Exception:
@@ -1764,7 +1874,9 @@ async def _solve(query: Query, question: str) -> Response:
 
     # A single targeted repair is allowed only when too little quote-verified
     # evidence survived. Do not spend another full wave merely to polish style.
-    if len(facts) < 2 and _elapsed(started) < REPAIR_LATEST_ELAPSED:
+    coverage_target = max(2, len(qmap.parts) if qmap.parts else 2)
+    needs_repair = len(facts) < coverage_target or _grid_has_real_gaps(grid)
+    if needs_repair and _elapsed(started) < REPAIR_LATEST_ELAPSED:
         repair = _repair_queries(grid)[:1]
         if repair:
             try:
@@ -1811,7 +1923,7 @@ async def _solve(query: Query, question: str) -> Response:
     if not _usable_answer(best_answer, question):
         # Evidence excerpts are safer than model-memory invention.
         best_answer = _fact_rescue(qmap, clean_grid, book)
-    if not _usable_answer(best_answer, question):
+    if not _usable_answer(best_answer, question) and not _requires_external_grounding(qmap):
         try:
             emergency = await _emergency_answer(question, deadline)
             emergency_ok = _grounded_answer(emergency, question, facts, book) if facts else _usable_answer(emergency, question)
@@ -1854,12 +1966,24 @@ async def query(query: Query) -> Response:
     try:
         return await _solve(query, question)
     except Exception:
-        # A final containment boundary.  Crucially, it never echoes the prompt.
-        deadline = monotonic() + 20.0
-        try:
-            answer = await _emergency_answer(question, deadline)
-        except Exception:
+        # A final containment boundary. Source-bound research questions are safer
+        # unanswered than confidently hallucinated from model memory.
+        low = question.lower()
+        source_bound = bool(
+            "official" in low
+            or "according to" in low
+            or "results page" in low
+            or "report" in low
+            or "exactly as" in low
+        )
+        if source_bound:
             answer = "No supported answer was produced."
+        else:
+            deadline = monotonic() + 30.0
+            try:
+                answer = await _emergency_answer(question, deadline)
+            except Exception:
+                answer = "No supported answer was produced."
         if query.output_schema is not None:
             return Response(output=_coerce(answer, query.output_schema))
         return Response(text=answer)
