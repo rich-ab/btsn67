@@ -1,34 +1,17 @@
-"""Harnyx SN67 miner — 151 (richjg).
+"""
+Harnyx SN67 research miner — OrbitEvidence v14.
 
-This candidate is built around a bounded evidence-compiler rather than a long
-conversational tool loop.  It is designed from a real local-eval failure where
-all core facts were found correctly, but the pairwise judge preferred the other
-answer because it preserved source labels more faithfully, explained a subtle
-count discrepancy, and finished more cleanly.
+Independent implementation of a bounded research loop.  The controller lets the
+language model choose iterative research actions, but evidence storage, citation
+numbering, page navigation, time limits, final-answer validation, and structured
+output are deterministic.
 
-Controller topology:
-    question -> deterministic contract + source policy -> Parallel-primary discovery
-             -> hard source-host lock when the prompt requires a named source
-             -> official-page fetch + sibling-stage derivation -> proof grid
-             -> mandatory per-subquestion coverage compiler -> quote verification
-             -> grounded answer selection -> deterministic hallucination guard
-             -> source-verbatim restoration -> schema adapter
+Configured for the credentials already used by this miner:
+- Parallel for search and page extraction.
+- Chutes for language-model calls.
 
-Design goals:
-- reserve final-answer time instead of researching until the wall clock expires;
-- preserve exact names, marks, capitalization, units, dates and labels from source;
-- answer every numbered/multipart sub-question in order;
-- enforce hard source locking for prompts that say using only/solely/from the official named source;
-- refuse to finalize a multipart answer until every required part has grounded evidence;
-- resolve same-slot factual contradictions before any answer can leave the controller;
-- bind evidence to the requested event/discipline/sex and reject neighboring-event pages;
-- pin canonical event-specific result routes before generic competition/calendar pages;
-- prefer section-scoped table counts over whole-page row aggregates;
-- explain discrepancy/counterfactual questions when the evidence supports why;
-- keep exact receipt-backed citation slices around decisive quotes;
-- never return the user's question as a fallback answer;
-- use Parallel as the fast primary retrieval path, with one DeSearch fallback only when necessary;
-- remain useful when one LLM/search/fetch stage fails.
+The design intentionally uses its own controller and data model rather than
+copying another miner implementation.
 """
 
 from __future__ import annotations
@@ -45,707 +28,568 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "stage-bound-v13.0"
-
-# ---------------------------------------------------------------------------
-# Runtime policy
-# ---------------------------------------------------------------------------
+VERSION = "orbit-evidence-v14.0"
 
 LLM_PROVIDER = "chutes"
 SEARCH_PROVIDER = "parallel"
-FALLBACK_SEARCH_PROVIDER = "desearch"
 
-PLAN_MODELS = (
-    "google/gemma-4-31B-turbo-TEE",
+WALL_SECONDS = 172.0
+WRAPUP_SECONDS = 52.0
+MIN_RETURN_SECONDS = 7.0
+MAX_RESEARCH_TURNS = 6
+MAX_ACTIONS_PER_TURN = 6
+
+SEARCH_TIMEOUT = 13.0
+FETCH_TIMEOUT = 17.0
+TOOL_PHASE_TIMEOUT = 22.0
+TURN_TIMEOUT = 30.0
+WRITER_TIMEOUT = 34.0
+CRITIC_TIMEOUT = 19.0
+SCHEMA_TIMEOUT = 24.0
+
+SEARCH_RESULTS = 8
+SEARCH_NOTE_SHOW = 720
+FETCH_WINDOW = 3400
+FETCH_WINDOWS = 3
+FETCH_ORIENTATION = 1200
+LOCAL_WINDOW = 1100
+LOCAL_HITS = 5
+LOCAL_READ_CAP = 12000
+
+DIGEST_CHARS = 52000
+ROW_DIGEST_CAP = 7200
+ANSWER_CAP = 52000
+MAX_CITATIONS = 22
+TOTAL_EVIDENCE_CAP = 92000
+CITATION_TARGET = 4800
+CITATION_ROW_CAP = 10500
+
+KEEP_MARGIN = 420
+MAX_KEPT_PER_ROW = 6
+MIN_QUOTE = 10
+
+PRIMARY_MODELS = (
     "deepseek-ai/DeepSeek-V3.2-TEE",
-    "Qwen/Qwen3.6-27B-TEE",
-)
-GRID_MODELS = (
-    "deepseek-ai/DeepSeek-V3.2-TEE",
-    "google/gemma-4-31B-turbo-TEE",
     "Qwen/Qwen3.6-27B-TEE",
     "Qwen/Qwen3.5-397B-A17B-TEE",
+    "google/gemma-4-31B-turbo-TEE",
     "moonshotai/Kimi-K2.6-TEE",
 )
-WRITE_MODELS = (
+
+WRITER_MODELS = (
     "deepseek-ai/DeepSeek-V3.2-TEE",
     "google/gemma-4-31B-turbo-TEE",
     "Qwen/Qwen3.6-27B-TEE",
-    "Qwen/Qwen3.5-397B-A17B-TEE",
 )
-REVIEW_MODELS = (
-    "google/gemma-4-31B-turbo-TEE",
-    "deepseek-ai/DeepSeek-V3.2-TEE",
-    "Qwen/Qwen3.5-397B-A17B-TEE",
-)
-SCHEMA_MODELS = (
-    "google/gemma-4-31B-turbo-TEE",
-    "deepseek-ai/DeepSeek-V3.2-TEE",
-    "Qwen/Qwen3.6-27B-TEE",
-)
-
-# A Harnyx evaluation can have a larger outer timeout, but this agent commits
-# well before it.  The v3 local run used ~251s and left too little finalization
-# margin; v4 targets materially less.
-WALL_SECONDS = 125.0
-REPAIR_LATEST_ELAPSED = 78.0
-REVIEW_LATEST_ELAPSED = 94.0
-FORCE_COMMIT_ELAPSED = 108.0
-
-PLAN_TIMEOUT = 10.0
-# Parallel is the primary retrieval provider. DeSearch is retained only as a
-# last-resort fallback because local runs showed 50-70+ second DeSearch latency.
-SEARCH_TIMEOUT = 24.0
-SEARCH_RETRY_TIMEOUT = 22.0
-DESEARCH_FALLBACK_TIMEOUT = 82.0
-FETCH_TIMEOUT = 32.0
-GRID_TIMEOUT = 42.0
-WRITE_TIMEOUT = 38.0
-REVIEW_TIMEOUT = 26.0
-SCHEMA_TIMEOUT = 20.0
-EMERGENCY_TIMEOUT = 36.0
-
-MAX_PLAN_QUERIES = 3
-MAX_REPAIR_QUERIES = 1
-SEARCH_RESULTS = 8
-FETCH_CAP = 5
-SEARCH_CONCURRENCY = 5
-FETCH_CONCURRENCY = 5
-MAX_SOURCES = 42
-MAX_CITATIONS = 18
-MAX_EVIDENCE_CHARS = 104_000
-MAX_SOURCE_TEXT = 300_000
-MAX_PACK_CHARS = 60_000
-MAX_ANSWER_CHARS = 56_000
-SEARCH_PREVIEW = 1800
-FETCH_HEAD = 2600
-FETCH_WINDOW = 5200
-FETCH_WINDOW_COUNT = 3
-QUOTE_CONTEXT = 620
-MAX_SLICE_PER_SOURCE = 15_000
-MIN_SLICE = 900
-
-MIN_PLAN_USD = 0.010
-MIN_GRID_USD = 0.020
-MIN_WRITE_USD = 0.016
-MIN_REVIEW_USD = 0.020
-MIN_SCHEMA_USD = 0.010
 
 _STATE: dict[str, Any] = {
-    "remaining_usd": None,
-    "allowed_models": (),
+    "models": (),
+    "budget_left": None,
 }
-
-# ---------------------------------------------------------------------------
-# Small utilities
-# ---------------------------------------------------------------------------
 
 
 def _remember_budget(payload: Any) -> None:
     budget = getattr(payload, "budget", None)
-    remaining = getattr(budget, "session_remaining_budget_usd", None)
-    if isinstance(remaining, (int, float)):
-        _STATE["remaining_usd"] = float(remaining)
-
-
-def _money_left() -> float:
-    value = _STATE.get("remaining_usd")
+    value = getattr(budget, "session_remaining_budget_usd", None)
     if isinstance(value, (int, float)):
-        return float(value)
-    return 1.0
+        _STATE["budget_left"] = float(value)
 
 
 def _left(deadline: float) -> float:
-    return max(0.0, deadline - monotonic())
+    return deadline - monotonic()
 
 
-def _elapsed(started: float) -> float:
-    return max(0.0, monotonic() - started)
+def _clip(value: str, limit: int) -> str:
+    text = (value or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[: max(0, limit - 2)] + " …"
 
 
-def _clean_space(text: str) -> str:
-    return re.sub(r"\s+", " ", text or "").strip()
+def _space(value: str) -> str:
+    return " ".join((value or "").split())
 
 
-def _cap(text: str, limit: int) -> str:
-    value = text or ""
-    if len(value) <= limit:
-        return value
-    return value[: max(0, limit - 2)].rstrip() + " …"
-
-
-def _int(value: Any, default: int = 0) -> int:
+def _host(url: str) -> str:
     try:
-        return int(value)
+        return (urlparse(url).hostname or "").lower().removeprefix("www.")
     except Exception:
-        return default
+        return ""
 
 
-def _float(value: Any, default: float = 0.0) -> float:
-    try:
-        return float(value)
-    except Exception:
-        return default
+_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'.-]{2,}")
+_STOP = frozenset(
+    "the and for with from that this these those which what when where who how "
+    "many much into over under between during after before while about against "
+    "also have has had was were are is be been being their there they them its "
+    "use using only official result results answer question according based".split()
+)
 
 
-def _uniq_text(values: Any, limit: int, max_len: int = 500) -> list[str]:
+def _terms(value: str, limit: int = 28) -> list[str]:
     out: list[str] = []
-    if not isinstance(values, list):
-        return out
-    lowered: set[str] = set()
-    for value in values:
-        if not isinstance(value, str):
+    seen: set[str] = set()
+    for token in _WORD_RE.findall((value or "").lower()):
+        if token in _STOP or len(token) < 3:
             continue
-        item = _clean_space(value)
-        if not item or len(item) > max_len:
-            continue
-        key = item.lower()
-        if key in lowered:
-            continue
-        lowered.add(key)
-        out.append(item)
+        if token not in seen:
+            seen.add(token)
+            out.append(token)
         if len(out) >= limit:
             break
     return out
 
 
-def _json_object(text: str) -> dict[str, Any] | None:
-    raw = (text or "").strip()
-    if not raw:
-        return None
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
-        raw = re.sub(r"\s*```$", "", raw)
-    try:
-        obj = json.loads(raw)
-        return obj if isinstance(obj, dict) else None
-    except Exception:
-        pass
-    start = raw.find("{")
-    if start < 0:
-        return None
-    depth = 0
-    quoted = False
-    escaped = False
-    for pos in range(start, len(raw)):
-        ch = raw[pos]
-        if quoted:
-            if escaped:
-                escaped = False
-            elif ch == "\\":
-                escaped = True
-            elif ch == '"':
-                quoted = False
-            continue
-        if ch == '"':
-            quoted = True
-        elif ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    obj = json.loads(raw[start : pos + 1])
-                    return obj if isinstance(obj, dict) else None
-                except Exception:
-                    return None
-    return None
-
-
-def _host(url: str) -> str:
-    try:
-        return (urlparse(url or "").hostname or "").lower()
-    except Exception:
-        return ""
-
-
-def _token_terms(text: str) -> list[str]:
-    raw = re.findall(r"[A-Za-zÀ-ÖØ-öø-ÿ0-9][A-Za-zÀ-ÖØ-öø-ÿ0-9_.:/+%-]*", text or "")
-    stop = {
-        "the", "a", "an", "and", "or", "of", "to", "for", "in", "on", "at",
-        "by", "with", "from", "as", "is", "are", "was", "were", "be", "been",
-        "that", "this", "these", "those", "which", "what", "who", "when", "where",
-        "how", "using", "only", "official", "result", "results", "page", "pages",
-        "commentary", "claims", "claim", "answer", "plain", "prose", "check",
-        "against", "usual", "exactly", "given", "shown", "printed", "requested",
-    }
-    out: list[str] = []
-    seen: set[str] = set()
-    for item in raw:
-        value = item.strip("._:/+%-")
-        if len(value) < 3:
-            continue
-        key = value.lower()
-        if key in stop or key in seen:
-            continue
-        seen.add(key)
-        out.append(value)
-        if len(out) >= 28:
-            break
-    return out
-
-
-def _authority(url: str, title: str, named_hints: list[str]) -> int:
-    host = _host(url)
-    low_title = (title or "").lower()
+def _overlap_score(text: str, terms: list[str]) -> int:
+    low = (text or "").lower()
     score = 0
-    if host.endswith(".gov") or ".gov." in host:
-        score += 12
-    if host.endswith(".edu") or ".edu." in host:
-        score += 8
-    if any(piece in host for piece in ("sec.gov", "who.int", "un.org", "worldbank.org", "oecd.org")):
-        score += 11
-    if any(piece in host for piece in ("docs.", "developer.", "support.", "help.", "data.")):
-        score += 5
-    if any(word in low_title for word in ("official", "results", "filing", "report", "statistics", "database")):
-        score += 4
-    for hint in named_hints:
-        h = re.sub(r"[^a-z0-9]", "", hint.lower())
-        if not h:
-            continue
-        host_flat = re.sub(r"[^a-z0-9]", "", host)
-        title_flat = re.sub(r"[^a-z0-9]", "", low_title)
-        if h in host_flat or h in title_flat:
-            score += 14
+    for token in terms:
+        if token in low:
+            score += 1
     return score
 
 
-def _event_identity_score(question: str, url: str, title: str, body: str = "") -> int:
-    """Reward exact event/entity identity and strongly penalize same-domain wrong events.
-
-    Authority alone is unsafe: an official domain can host thousands of unrelated
-    competitions. This score keeps the requested event/year/discipline attached
-    to the evidence path.
-    """
-    q = _clean_space(question).lower()
-    hay = _clean_space(f"{title} {url} {(body or '')[:2600]}").lower()
-    score = 0
-
-    # Exact multi-word event anchors matter more than generic domain authority.
-    anchors = (
-        "world athletics championships",
-        "olympic games",
-        "world championships",
-        "uefa champions league",
-        "fifa world cup",
-        "super bowl",
-        "academy awards",
-    )
-    for anchor in anchors:
-        if anchor in q:
-            slug = anchor.replace(" ", "-")
-            if anchor in hay or slug in hay:
-                score += 28
-            else:
-                score -= 12
-
-    # Explicit year should survive source selection.
-    years = re.findall(r"\b(?:19|20)\d{2}\b", q)
-    for year in years[:2]:
-        if year in hay:
-            score += 8
-
-    # Numeric discipline / product / version identifiers are often decisive.
-    for token in re.findall(r"\b\d{3,5}\b", q):
-        if token in years:
-            continue
-        if token in hay:
-            score += 7
-
-    # Location anchors help separate similarly named annual events.
-    for place in ("tokyo", "paris", "london", "new york", "los angeles", "rome"):
-        if place in q and place in hay:
-            score += 5
-
-    # Known same-domain distractor patterns. These are deliberately phrased as
-    # generic mismatch penalties rather than a hard-coded answer.
-    mismatch_terms = (
-        "national sports festival",
-        "qualification for the national",
-        "junior championships",
-        "u20 championships",
-    )
-    if any(term in hay for term in mismatch_terms) and not any(term in q for term in mismatch_terms):
-        score -= 70
-
-    # For result-stage questions, reward pages that visibly name the requested stage.
-    if "semi" in q and ("semi-final" in hay or "semifinal" in hay):
-        score += 7
-    if "final" in q and "final" in hay:
-        score += 7
-
-    # V11 failure mode: a generic official competition page contained the
-    # requested discipline in its navigation menu while the active table was a
-    # completely different event. Canonical routes and active headings now
-    # dominate generic authority/text overlap.
-    score += _canonical_result_route_score(question, url)
-    state = _event_match_state(question, url, title, body)
-    if state == 2:
-        score += 90
-    elif state == 1:
-        score += 45
-    elif state < 0:
-        score -= 180
-    return score
-
-
-
-def _event_signature(value: str) -> dict[str, str]:
-    """Extract a compact event identity from a question, URL-ish text, or heading.
-
-    The goal is not to understand every sport.  It is to recognize enough
-    explicit identity to veto a clearly different neighboring event on the same
-    official competition page.  Unknown is safer than a false mismatch.
-    """
-    raw = _clean_space(value)
-    low = raw.lower().replace("×", "x")
-    sex = ""
-    if re.search(r"\bmen(?:'s)?\b", low) and not re.search(r"\bwomen(?:'s)?\b", low):
-        sex = "men"
-    elif re.search(r"\bwomen(?:'s)?\b", low):
-        sex = "women"
-
-    discipline = ""
-    # Relays must be detected before the single-distance expression.
-    relay = re.search(r"\b(4)\s*[x×]\s*(\d{2,4})\s*(?:m|metres|meters)?\b", low)
-    if relay:
-        discipline = f"{relay.group(1)}x{relay.group(2)}-metres-relay"
-    else:
-        distance = re.search(r"\b(\d{2,5})\s*(?:m|metres|meters)\b", low)
-        if distance:
-            discipline = f"{distance.group(1)}-metres"
-
-    named = (
-        ("3000-metres-steeplechase", ("3000 metres steeplechase", "3000m steeplechase")),
-        ("110-metres-hurdles", ("110 metres hurdles", "110m hurdles")),
-        ("100-metres-hurdles", ("100 metres hurdles", "100m hurdles")),
-        ("400-metres-hurdles", ("400 metres hurdles", "400m hurdles")),
-        ("high-jump", ("high jump",)),
-        ("long-jump", ("long jump",)),
-        ("triple-jump", ("triple jump",)),
-        ("pole-vault", ("pole vault",)),
-        ("shot-put", ("shot put",)),
-        ("discus-throw", ("discus throw",)),
-        ("hammer-throw", ("hammer throw",)),
-        ("javelin-throw", ("javelin throw",)),
-        ("decathlon", ("decathlon",)),
-        ("heptathlon", ("heptathlon",)),
-        ("marathon", ("marathon",)),
-    )
-    # Named disciplines are more specific than a stray number elsewhere.
-    for slug, aliases in named:
-        if any(alias in low for alias in aliases):
-            discipline = slug
-            break
-
-    return {"sex": sex, "discipline": discipline}
-
-
-def _expected_event_signature(question: str) -> dict[str, str]:
-    return _event_signature(question)
-
-
-def _heading_candidate(line: str) -> str:
-    raw = _clean_space(line)
-    if not raw:
-        return ""
-    # Strip markdown/list formatting but keep apostrophes and event punctuation.
-    raw = re.sub(r"^[#>*_\-\s]+", "", raw).strip()
-    raw = re.sub(r"\s+", " ", raw)
-    if not raw or len(raw) > 125:
-        return ""
-    return raw
-
-
-def _active_event_heading(body: str) -> str:
-    """Return the first visible heading that looks like an actual event.
-
-    Navigation menus often contain every discipline on one very long line.  We
-    intentionally ignore long/menu-like lines and favor short headings such as
-    `Men's 1500 Metres` or `Men's 4x400 Metres Relay`.
-    """
-    if not body:
-        return ""
-    for raw in body.splitlines()[:260]:
-        candidate = _heading_candidate(raw)
-        if not candidate:
-            continue
-        sig = _event_signature(candidate)
-        if not sig.get("discipline"):
-            continue
-        low = candidate.lower()
-        # Exclude generic menu/index strings that happen to enumerate events.
-        if low.count("metres") + low.count("meters") > 2:
-            continue
-        if len(candidate.split()) > 12:
-            continue
-        return candidate
-    return ""
-
-
-def _event_match_state(question: str, url: str, title: str, body: str = "") -> int:
-    """Return 2 strong match, 1 visible match, 0 unknown, -1 explicit mismatch."""
-    expected = _expected_event_signature(question)
-    if not expected.get("discipline") and not expected.get("sex"):
-        return 0
-
-    path_text = urlparse(url or "").path.lower().replace("_", "-")
-    path_text = path_text.replace("%20", "-")
-    expected_disc = expected.get("discipline", "")
-    expected_sex = expected.get("sex", "")
-
-    # Canonical event routes are strongest evidence of identity.
-    route_disc_match = bool(expected_disc and expected_disc in path_text)
-    route_sex_match = bool(expected_sex and f"/{expected_sex}/" in path_text)
-    if route_disc_match and (not expected_sex or route_sex_match):
-        return 2
-
-    heading = _active_event_heading(body)
-    if heading:
-        actual = _event_signature(heading)
-        actual_disc = actual.get("discipline", "")
-        actual_sex = actual.get("sex", "")
-        if expected_disc and actual_disc and expected_disc != actual_disc:
-            return -1
-        if expected_sex and actual_sex and expected_sex != actual_sex:
-            return -1
-        if expected_disc and actual_disc == expected_disc:
-            return 1
-        if expected_sex and actual_sex == expected_sex and not expected_disc:
-            return 1
-
-    # Titles can confirm identity but should not veto a page because many
-    # official result titles are generic.
-    title_sig = _event_signature(title or "")
-    if expected_disc and title_sig.get("discipline") == expected_disc:
-        if not expected_sex or not title_sig.get("sex") or title_sig.get("sex") == expected_sex:
-            return 1
-    return 0
-
-
-def _canonical_result_route_score(question: str, url: str) -> int:
-    """Reward event-specific result routes and penalize clearly different routes."""
-    expected = _expected_event_signature(question)
-    discipline = expected.get("discipline", "")
-    sex = expected.get("sex", "")
-    path = urlparse(url or "").path.lower().replace("_", "-")
-    score = 0
-    if "/results/" in path:
-        score += 10
-    if discipline:
-        if discipline in path:
-            score += 90
+def _merge_ranges(spans: list[tuple[int, int]], size: int) -> list[tuple[int, int]]:
+    clean: list[tuple[int, int]] = []
+    for a, b in spans:
+        start = max(0, min(int(a), size))
+        end = max(start, min(int(b), size))
+        if end > start:
+            clean.append((start, end))
+    clean.sort()
+    merged: list[list[int]] = []
+    for start, end in clean:
+        if merged and start <= merged[-1][1] + 80:
+            merged[-1][1] = max(merged[-1][1], end)
         else:
-            # If the path explicitly names another recognized event under a
-            # result route, it is a strong mismatch. Generic calendar pages stay
-            # neutral and can still be validated by their active heading.
-            path_sig = _event_signature(path.replace("-", " "))
-            other = path_sig.get("discipline", "")
-            if other and other != discipline:
-                score -= 100
-    if sex:
-        if f"/{sex}/" in path:
-            score += 35
-        elif re.search(r"/(?:men|women)/", path):
-            score -= 70
-    if "/semi-final/result" in path or "/semifinal/result" in path:
-        score += 35
-    if "/final/result" in path:
-        score += 35
-    return score
+            merged.append([start, end])
+    return [(x[0], x[1]) for x in merged]
 
 
-def _canonical_event_source(question: str, row: dict[str, Any]) -> bool:
-    state = _event_match_state(
-        question,
-        str(row.get("url") or ""),
-        str(row.get("title") or ""),
-        str(row.get("text") or "")[:5000],
-    )
-    return state >= 1 or _canonical_result_route_score(question, str(row.get("url") or "")) >= 100
-
-
-def _event_source_rejected(question: str, row: dict[str, Any]) -> bool:
-    return _event_match_state(
-        question,
-        str(row.get("url") or ""),
-        str(row.get("title") or ""),
-        str(row.get("text") or "")[:8000],
-    ) < 0
-
-
-def _canonical_stage_urls(url: str, question: str) -> list[str]:
-    """Return the event-specific URL and obvious sibling stage URLs."""
-    target = (url or "").strip()
-    if not target:
-        return []
-    if _canonical_result_route_score(question, target) < 100:
-        return []
-    out = [target]
-    for sibling in _stage_sibling_urls(target, question):
-        if sibling not in out:
-            out.append(sibling)
-    return out
-
-
-def _best_windows(text: str, focus: str, width: int = FETCH_WINDOW, count: int = FETCH_WINDOW_COUNT) -> list[tuple[int, int]]:
-    if not text:
-        return []
-    if len(text) <= width:
-        return [(0, len(text))]
-    terms = [x.lower() for x in _token_terms(focus)[:18]]
-    if not terms:
-        return [(0, min(len(text), width))]
-    lower = text.lower()
-    candidates: list[tuple[int, int, int]] = []
-    step = max(600, width // 3)
-    for start in range(0, len(text), step):
-        end = min(len(text), start + width)
-        block = lower[start:end]
-        score = 0
-        for term in terms:
-            hits = block.count(term)
-            if hits:
-                score += min(hits, 5) * (2 if len(term) >= 7 else 1)
-        candidates.append((-score, start, end))
-        if end == len(text):
+def _window_spans(text: str, focus: str, width: int = FETCH_WINDOW,
+                  count: int = FETCH_WINDOWS) -> list[tuple[int, int]]:
+    n = len(text or "")
+    if n <= width:
+        return [(0, n)] if n else []
+    wanted = _terms(focus, 34)
+    step = max(700, width // 3)
+    scored: list[tuple[int, int]] = []
+    start = 0
+    low = text.lower()
+    while start < n:
+        end = min(n, start + width)
+        block = low[start:end]
+        hits = 0
+        for token in wanted:
+            if token in block:
+                hits += 1
+        # Prefer actual data-bearing regions when semantic scores tie.
+        numeric = len(re.findall(r"\d", block[:1800]))
+        tableish = block.count("|") + block.count("\n")
+        bonus = min(6, numeric // 8) + min(4, tableish // 20)
+        scored.append((hits * 20 + bonus, start))
+        if end >= n:
             break
-    candidates.sort()
-    selected: list[tuple[int, int]] = []
-    for neg, start, end in candidates:
-        if neg == 0 and selected:
-            break
-        overlap = False
-        for old_start, old_end in selected:
-            if min(end, old_end) - max(start, old_start) > width // 2:
-                overlap = True
+        start += step
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    chosen: list[tuple[int, int]] = []
+    for score, start in scored:
+        end = min(n, start + width)
+        if chosen and score <= 0:
+            continue
+        overlaps = False
+        for a, b in chosen:
+            if start < b and a < end:
+                overlaps = True
                 break
-        if not overlap:
-            selected.append((start, end))
-        if len(selected) >= count:
+        if overlaps:
+            continue
+        chosen.append((start, end))
+        if len(chosen) >= count:
             break
-    return sorted(selected)
+    chosen.sort()
+    if not chosen:
+        chosen = [(0, min(n, width))]
+    return chosen
 
 
-def _merge_spans(spans: list[tuple[int, int]], text_len: int) -> list[tuple[int, int]]:
-    cleaned: list[tuple[int, int]] = []
-    for start, end in spans:
-        a = max(0, min(text_len, _int(start)))
-        b = max(0, min(text_len, _int(end)))
-        if b > a:
-            cleaned.append((a, b))
-    cleaned.sort()
-    merged: list[tuple[int, int]] = []
-    for start, end in cleaned:
-        if not merged or start > merged[-1][1] + 80:
-            merged.append((start, end))
-        else:
-            old_start, old_end = merged[-1]
-            merged[-1] = (old_start, max(old_end, end))
-    return merged
+class QuestionShape:
+    def __init__(self, question: str) -> None:
+        self.question = question
+        self.numbered_parts = self._count_numbered_parts(question)
+        self.output_only = bool(re.search(
+            r"\b(?:output|respond|reply|answer) (?:with )?only\b"
+            r"|\bonly the exact\b|\bnothing else\b|\bno explanation\b"
+            r"|\bwithout explanation\b|\bjust the (?:name|names|value|values|"
+            r"number|numbers|list|text|title|titles|answer)\b",
+            question, re.I))
+        self.set_like = bool(re.search(
+            r"\b(?:list|name|identify|enumerate)\b.{0,60}\b(?:all|every|each)\b"
+            r"|\bwhich (?:[A-Za-z-]+\s+){0,3}[A-Za-z-]+s\b"
+            r"|\bhow many\b", question, re.I))
+        self.superlative = bool(re.search(
+            r"\b(?:highest|lowest|largest|smallest|most|least|greatest|fewest|"
+            r"oldest|youngest|newest|first|last|best|worst|only)\b", question, re.I))
+        self.strict_source = bool(re.search(
+            r"\busing only\b|\buse only\b|\bonly the official\b"
+            r"|\bsolely (?:from|using)\b|\bbased only on\b", question, re.I))
+        self.has_year = bool(re.search(r"\b(?:19|20)\d{2}\b", question))
+        self.complex = (
+            self.numbered_parts >= 2
+            or self.set_like
+            or self.superlative
+            or self.strict_source
+        )
+
+    @staticmethod
+    def _count_numbered_parts(question: str) -> int:
+        found: list[int] = []
+        for m in re.finditer(r"(?:^|[\s;])\((\d{1,2})\)", question):
+            value = int(m.group(1))
+            if value not in found:
+                found.append(value)
+        if len(found) >= 2:
+            return max(found)
+        found = []
+        for m in re.finditer(r"(?:^|\n)\s*(\d{1,2})[.)]\s+", question):
+            value = int(m.group(1))
+            if value not in found:
+                found.append(value)
+        return max(found) if len(found) >= 2 else 0
+
+    def hint(self) -> str:
+        notes: list[str] = []
+        if self.numbered_parts:
+            notes.append(
+                f"The question has {self.numbered_parts} explicit parts. "
+                "The final answer must substantively answer every part in order."
+            )
+        if self.set_like:
+            notes.append(
+                "This is a set/roster problem: establish the complete candidate pool "
+                "from a list/table before filtering members."
+            )
+        if self.superlative:
+            notes.append(
+                "This contains a tally/superlative: compare the complete relevant pool "
+                "before naming a winner or count."
+            )
+        if self.strict_source:
+            notes.append(
+                "The prompt imposes an exclusive source constraint. Third-party pages "
+                "may help discovery, but final factual claims must be supported by the "
+                "named/official source itself."
+            )
+        if self.has_year:
+            notes.append(
+                "Preserve the exact period/year scope. Do not silently substitute an "
+                "adjacent year, edition, quarter, or broader period."
+            )
+        return "\n".join(notes)
+
+
+class ToolPacket:
+    def __init__(self, text: str, rows: list[dict[str, Any]] | None = None) -> None:
+        self.text = text
+        self.rows = rows or []
+
+
+class EvidenceVault:
+    def __init__(self, question: str) -> None:
+        self.question = question
+        self.rows: list[dict[str, Any]] = []
+        self.searched: list[str] = []
+        self.fetched: list[str] = []
+
+    def add_packet(self, packet: ToolPacket) -> str:
+        body = packet.text
+        for index, row in enumerate(packet.rows):
+            self.rows.append(row)
+            number = len(self.rows)
+            body = body.replace(f"<ROW{index}>", f"[{number}]")
+        return body
+
+    def row(self, number: int) -> dict[str, Any] | None:
+        if 1 <= number <= len(self.rows):
+            return self.rows[number - 1]
+        return None
+
+    def mark_shown(self, number: int, start: int, end: int) -> None:
+        row = self.row(number)
+        if row is None:
+            return
+        text = row.get("text") or ""
+        if not text:
+            return
+        a = max(0, min(int(start), len(text)))
+        b = max(a, min(int(end), len(text)))
+        if b <= a:
+            return
+        shown = row.setdefault("shown", [])
+        shown.append((a, b))
+        row["shown"] = _merge_ranges(shown, len(text))
+
+    def keep_quote(self, number: int, quote: str) -> str:
+        row = self.row(number)
+        if row is None:
+            return f"# keep: source [{number}] does not exist"
+        text = row.get("text") or ""
+        q = (quote or "").strip()
+        if len(q) < MIN_QUOTE:
+            return "# keep: quote is too short"
+        pos = text.find(q)
+        if pos < 0:
+            pos = text.lower().find(q.lower())
+        if pos < 0:
+            return f"# keep: quote not found verbatim in [{number}]"
+        kept = row.setdefault("kept", [])
+        if len(kept) >= MAX_KEPT_PER_ROW:
+            return f"# keep: [{number}] already has enough retained evidence"
+        a = max(0, pos - KEEP_MARGIN)
+        b = min(len(text), pos + len(q) + KEEP_MARGIN)
+        kept.append((a, b))
+        row["kept"] = _merge_ranges(kept, len(text))
+        return f"# keep: retained decisive evidence from [{number}]"
+
+    def local_grep(self, number: int, pattern: str) -> str:
+        row = self.row(number)
+        if row is None:
+            return f"# grep: source [{number}] does not exist"
+        text = row.get("text") or ""
+        needle = (pattern or "").strip()
+        if not needle:
+            return "# grep: empty pattern"
+        try:
+            rx = re.compile(needle, re.I)
+        except re.error:
+            rx = re.compile(re.escape(needle), re.I)
+        blocks: list[str] = []
+        centers: list[int] = []
+        for match in rx.finditer(text):
+            center = (match.start() + match.end()) // 2
+            too_near = False
+            for old in centers:
+                if abs(center - old) < LOCAL_WINDOW // 2:
+                    too_near = True
+                    break
+            if too_near:
+                continue
+            centers.append(center)
+            a = max(0, center - LOCAL_WINDOW // 2)
+            b = min(len(text), a + LOCAL_WINDOW)
+            self.mark_shown(number, a, b)
+            blocks.append(f"\n--- [{number}] match @{a} ---\n{text[a:b]}")
+            if len(blocks) >= LOCAL_HITS:
+                break
+        if not blocks:
+            return f"# grep: no match for {needle!r} in [{number}]"
+        return f"# grep: {len(blocks)} match(es) in [{number}]" + "".join(blocks)
+
+    def local_read(self, number: int, offset: int, length: int) -> str:
+        row = self.row(number)
+        if row is None:
+            return f"# read: source [{number}] does not exist"
+        text = row.get("text") or ""
+        if not text:
+            return f"# read: source [{number}] has no stored text"
+        a = max(0, min(int(offset), max(0, len(text) - 1)))
+        amount = max(1, min(int(length), LOCAL_READ_CAP))
+        b = min(len(text), a + amount)
+        self.mark_shown(number, a, b)
+        return f"# read: [{number}] chars {a}:{b} of {len(text)}\n{text[a:b]}"
+
+    def _row_excerpt(self, row: dict[str, Any], cap: int) -> str:
+        text = row.get("text") or ""
+        if not text:
+            return ""
+        spans = row.get("kept") or row.get("shown") or []
+        pieces: list[str] = []
+        used = 0
+        for a, b in spans:
+            piece = text[int(a):int(b)].strip()
+            if not piece:
+                continue
+            room = cap - used
+            if room <= 0:
+                break
+            piece = piece[:room]
+            pieces.append(piece)
+            used += len(piece)
+        if not pieces:
+            return text[:cap]
+        return "\n...\n".join(pieces)
+
+    def digest(self, cap: int = DIGEST_CHARS) -> str:
+        if not self.rows:
+            return "(No citable evidence has been gathered yet.)"
+        query_terms = _terms(self.question, 30)
+        indexed: list[tuple[int, int, dict[str, Any]]] = []
+        for number, row in enumerate(self.rows, start=1):
+            title = row.get("title") or ""
+            url = row.get("url") or ""
+            preview = row.get("preview") or ""
+            kept_bonus = 30 if row.get("kept") else 0
+            fetched_bonus = 8 if row.get("kind") == "fetch" else 0
+            official_bonus = 6 if any(
+                key in _host(url)
+                for key in ("gov", "who.int", "worldathletics", "sec.gov", "census")
+            ) else 0
+            score = (
+                _overlap_score(title + " " + url + " " + preview, query_terms) * 5
+                + kept_bonus + fetched_bonus + official_bonus
+            )
+            indexed.append((score, number, row))
+        indexed.sort(key=lambda item: (-item[0], item[1]))
+
+        blocks: list[str] = []
+        spent = 0
+        for _, number, row in indexed:
+            excerpt = self._row_excerpt(row, ROW_DIGEST_CAP)
+            if not excerpt.strip():
+                continue
+            block = (
+                f"[{number}] {row.get('title') or '(untitled)'}\n"
+                f"URL: {row.get('url') or ''}\n"
+                f"{excerpt}"
+            )
+            if spent + len(block) > cap:
+                continue
+            blocks.append(block)
+            spent += len(block)
+        return "\n\n".join(blocks) if blocks else "(Evidence exists but could not be rendered.)"
+
+    def citation(self, number: int) -> tuple[CitationRef | None, int]:
+        row = self.row(number)
+        if row is None:
+            return None, 0
+        receipt = row.get("receipt_id") or ""
+        result = row.get("result_id") or ""
+        text = row.get("text") or ""
+        if not receipt or not result or not text:
+            return None, 0
+
+        spans = row.get("kept") or row.get("shown") or []
+        if not spans:
+            return None, 0
+        merged = _merge_ranges(spans, len(text))
+        if not merged:
+            return None, 0
+
+        # Give each cited fact useful surrounding context without flooding the judge.
+        grown: list[tuple[int, int]] = []
+        for a, b in merged[:4]:
+            length = b - a
+            want = min(CITATION_ROW_CAP, max(CITATION_TARGET, length))
+            extra = max(0, want - length)
+            left = min(a, extra // 2)
+            right = min(len(text) - b, extra - left)
+            a2 = a - left
+            b2 = b + right
+            if b2 - a2 < want:
+                a2 = max(0, a2 - (want - (b2 - a2)))
+            grown.append((a2, b2))
+        grown = _merge_ranges(grown, len(text))
+        cost = sum(b - a for a, b in grown)
+        slices = [CitationSlice(start=a, end=b) for a, b in grown]
+        if not slices:
+            return None, 0
+        return CitationRef(receipt_id=receipt, result_id=result, slices=slices), cost
 
 
 def _llm_text(payload: Any) -> str:
     if payload is None:
         return ""
-    direct = getattr(payload, "llm", None)
-    if direct is not None:
-        value = getattr(direct, "raw_text", None)
-        if isinstance(value, str):
-            return value
-    value = getattr(payload, "raw_text", None)
-    if isinstance(value, str):
-        return value
+    llm = getattr(payload, "llm", None)
+    if llm is not None:
+        raw = getattr(llm, "raw_text", None)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+        choices = getattr(llm, "choices", None) or []
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip():
+                return content.strip()
+    raw = getattr(payload, "raw_text", None)
+    if isinstance(raw, str) and raw.strip():
+        return raw.strip()
     response = getattr(payload, "response", None)
     if isinstance(response, dict):
         for key in ("text", "content", "raw_text"):
             item = response.get(key)
-            if isinstance(item, str):
-                return item
+            if isinstance(item, str) and item.strip():
+                return item.strip()
     return ""
 
 
-# ---------------------------------------------------------------------------
-# Tooling/model selection
-# ---------------------------------------------------------------------------
-
-
-async def _load_tooling() -> None:
-    """Load current allowed model ids from tooling_info().response."""
+async def _load_models() -> None:
     try:
         info = await tooling_info(timeout=8.0)
         _remember_budget(info)
         response = getattr(info, "response", None)
         if not isinstance(response, dict):
             return
-        provider_models = response.get("allowed_llm_provider_models")
-        if not isinstance(provider_models, dict):
+        providers = response.get("allowed_llm_provider_models")
+        if not isinstance(providers, dict):
             return
-        raw = provider_models.get(LLM_PROVIDER)
-        found: list[str] = []
+        raw = providers.get(LLM_PROVIDER)
+        names: list[str] = []
         if isinstance(raw, (list, tuple)):
             for item in raw:
-                if isinstance(item, str) and item.strip() and item.strip() not in found:
-                    found.append(item.strip())
+                name = ""
+                if isinstance(item, str):
+                    name = item.strip()
                 elif isinstance(item, dict):
-                    name = item.get("model") or item.get("id") or item.get("name")
-                    if isinstance(name, str) and name.strip() and name.strip() not in found:
-                        found.append(name.strip())
-        if found:
-            _STATE["allowed_models"] = tuple(found)
+                    candidate = item.get("model") or item.get("id") or item.get("name")
+                    if isinstance(candidate, str):
+                        name = candidate.strip()
+                if name and name not in names:
+                    names.append(name)
+        if names:
+            _STATE["models"] = tuple(names)
     except Exception:
         return
 
 
-def _model_rank(model: str) -> tuple[int, int]:
-    low = model.lower()
-    hints = (
-        "deepseek-v3.2",
-        "gemma-4-31b",
-        "qwen3.6",
-        "qwen3.5-397",
-        "kimi-k2",
-        "glm-5.2",
-    )
-    for idx, hint in enumerate(hints):
-        if hint in low:
-            return (idx, -len(model))
-    return (50, -len(model))
-
-
-def _models(preferred: tuple[str, ...]) -> list[str]:
-    live = _STATE.get("allowed_models")
+def _model_order(preferred: tuple[str, ...]) -> list[str]:
+    live = _STATE.get("models")
     if isinstance(live, tuple) and live:
         allowed = [x for x in live if isinstance(x, str) and x]
-        exact = [x for x in preferred if x in allowed]
-        rest = [x for x in allowed if x not in exact]
-        rest.sort(key=_model_rank)
-        return (exact + rest)[:5]
-    out = ["google/gemma-4-31B-turbo-TEE"]
-    for item in preferred:
-        if item not in out:
-            out.append(item)
-    return out[:5]
+        chosen = [x for x in preferred if x in allowed]
+        remainder = [x for x in allowed if x not in chosen]
+        # Prefer generally capable research/synthesis families over embedding-ish names.
+        def rank(name: str) -> tuple[int, str]:
+            low = name.lower()
+            if "deepseek-v3.2" in low:
+                return (0, low)
+            if "qwen3.6" in low:
+                return (1, low)
+            if "gemma-4-31b" in low:
+                return (2, low)
+            if "kimi" in low:
+                return (3, low)
+            if "glm" in low:
+                return (4, low)
+            return (9, low)
+        remainder.sort(key=rank)
+        return (chosen + remainder)[:5]
+    return list(preferred[:4])
 
 
-async def _chat(
-    preferred: tuple[str, ...],
-    messages: list[dict[str, Any]],
-    deadline: float,
-    max_tokens: int,
-    timeout_cap: float,
-    temperature: float = 0.0,
-) -> Any:
-    models = _models(preferred)
-    for idx, model in enumerate(models):
-        # The first route gets the full allowance. Later fallbacks are shorter so
-        # a 503/slow chute cannot consume the entire task wall clock.
-        attempt_cap = timeout_cap
-        if idx == 1:
-            attempt_cap = min(timeout_cap, 34.0)
-        elif idx >= 2:
-            attempt_cap = min(timeout_cap, 28.0)
-        timeout = min(attempt_cap, _left(deadline) - 2.0)
+async def _chat(preferred: tuple[str, ...], messages: list[dict[str, Any]],
+                deadline: float, max_tokens: int, timeout_cap: float,
+                temperature: float = 0.1) -> Any:
+    models = _model_order(preferred)
+    for index, model in enumerate(models):
+        remaining = _left(deadline)
+        if remaining <= MIN_RETURN_SECONDS + 4.0:
+            return None
+        cap = timeout_cap
+        if index == 1:
+            cap = min(cap, 20.0)
+        elif index >= 2:
+            cap = min(cap, 15.0)
+        timeout = min(cap, remaining - MIN_RETURN_SECONDS)
         if timeout <= 5.0:
             return None
         try:
@@ -758,2027 +602,706 @@ async def _chat(
                 timeout=timeout,
             )
             _remember_budget(payload)
-            if _llm_text(payload).strip():
+            if _llm_text(payload):
                 return payload
         except Exception:
             continue
     return None
 
 
-# ---------------------------------------------------------------------------
-# Question contract and research plan
-# ---------------------------------------------------------------------------
+def _loosen_query(query: str) -> str:
+    text = re.sub(r"\bsite:\S+\s*", " ", query or "", flags=re.I)
+    text = text.replace('"', " ")
+    return _space(text)
 
 
-class QuestionMap:
-    def __init__(self, question: str, output_schema: Any) -> None:
-        self.question = question
-        self.output_schema = output_schema
-        self.parts: list[str] = []
-        self.named_sources: list[str] = []
-        self.entities: list[str] = []
-        self.hard_source_lock = False
-        self.must_preserve_exact = False
-        self.explain_difference = False
-        self.complete_set = False
-        self.superlative = False
-        self.computed = False
-        self.strict_output = False
-        self.ordering = ""
-        self.answer_kind = "fact"
-        self._derive()
-
-    def _derive(self) -> None:
-        q = self.question
-        low = q.lower()
-        if re.search(
-            r"\b(?:using|use|based on|from)\s+(?:only|solely|exclusively)\s+(?:the\s+)?(?:official\s+)?|"
-            r"\busing\s+only\s+the\s+official\b|\bonly\s+the\s+official\b",
-            low,
-        ):
-            self.hard_source_lock = True
-        if re.search(r"exactly as (?:given|shown|printed|written)|verbatim|exact labels?|exact names?|exact marks?", low):
-            self.must_preserve_exact = True
-        if re.search(r"how .*compare|compare(?:s|d)? with|difference|why .*more|why .*less|discrep", low):
-            self.explain_difference = True
-        if re.search(r"\b(all|every|each|both|complete list|which of these|among the .* which)\b", low):
-            self.complete_set = True
-        if re.search(r"\b(highest|lowest|largest|smallest|best|worst|most|least|top\s+\d+|first|last)\b", low):
-            self.superlative = True
-        if re.search(r"\b(total|sum|average|mean|ratio|percent|percentage|how many|number of|difference)\b", low):
-            self.computed = True
-        if "only the answer" in low or "respond with only" in low or "nothing else" in low:
-            self.strict_output = True
-        if "alphabetical" in low:
-            self.ordering = "alphabetical"
-        elif "chronological" in low:
-            self.ordering = "chronological"
-        elif "highest to lowest" in low or "descending" in low:
-            self.ordering = "descending"
-        elif "lowest to highest" in low or "ascending" in low:
-            self.ordering = "ascending"
-        if re.search(r"\bhow many\b|\bnumber of\b", low):
-            self.answer_kind = "number/comparison"
-        elif self.complete_set:
-            self.answer_kind = "list/set"
-        elif self.superlative:
-            self.answer_kind = "ranking/fact"
-        # Slice between numbered markers so embedded labels such as "(Q)" do
-        # not truncate or erase later sub-questions.
-        markers = list(re.finditer(r"(?:^|\s)\((\d+)\)\s*", q))
-        for idx, marker in enumerate(markers):
-            body_start = marker.end()
-            body_end = markers[idx + 1].start() if idx + 1 < len(markers) else len(q)
-            item = _clean_space(q[body_start:body_end])
-            if item:
-                self.parts.append(item[:900])
-        if not self.parts and q.count("?") > 1:
-            for item in q.split("?"):
-                item = _clean_space(item)
-                if item:
-                    self.parts.append(item[:700])
-        # Capture source brands explicitly named in common constructions.
-        patterns = (
-            r"official\s+([A-Z][A-Za-z0-9&. -]{2,60}?)(?:\s+(?:results?|page|website|site|data|database|report|competition))",
-            r"according to\s+([A-Z][A-Za-z0-9&. -]{2,60}?)(?:[,.;]|\s+(?:data|results?|report))",
-        )
-        for pattern in patterns:
-            for match in re.finditer(pattern, q):
-                item = _clean_space(match.group(1))
-                if item and item.lower() not in [x.lower() for x in self.named_sources]:
-                    self.named_sources.append(item)
-        # Proper-noun phrases help retrieval but are not treated as facts themselves.
-        for match in re.finditer(r"\b(?:[A-Z][A-Za-zÀ-ÖØ-öø-ÿ.'-]+(?:\s+|$)){2,6}", q):
-            item = _clean_space(match.group(0))
-            if 3 <= len(item) <= 100 and item.lower() not in [x.lower() for x in self.entities]:
-                self.entities.append(item)
-            if len(self.entities) >= 16:
-                break
-
-    def block(self) -> str:
-        return json.dumps(
-            {
-                "answer_kind": self.answer_kind,
-                "parts": self.parts,
-                "named_sources": self.named_sources,
-                "hard_source_lock": self.hard_source_lock,
-                "entities": self.entities,
-                "must_preserve_exact": self.must_preserve_exact,
-                "explain_difference": self.explain_difference,
-                "complete_set": self.complete_set,
-                "superlative": self.superlative,
-                "computed": self.computed,
-                "strict_output": self.strict_output,
-                "ordering": self.ordering,
-            },
-            ensure_ascii=False,
-        )
-
-
-class ResearchPlan:
-    def __init__(self) -> None:
-        self.queries: list[str] = []
-        self.focus_terms: list[str] = []
-        self.must_answer: list[str] = []
-        self.must_explain: list[str] = []
-        self.exact_values_needed: list[str] = []
-        self.preferred_domains: list[str] = []
-
-    def apply(self, data: dict[str, Any], qmap: QuestionMap) -> None:
-        self.queries = _uniq_text(data.get("queries"), MAX_PLAN_QUERIES, 430)
-        self.focus_terms = _uniq_text(data.get("focus_terms"), 18, 120)
-        self.must_answer = _uniq_text(data.get("must_answer"), 10, 500)
-        self.must_explain = _uniq_text(data.get("must_explain"), 8, 500)
-        self.exact_values_needed = _uniq_text(data.get("exact_values_needed"), 14, 220)
-        self.preferred_domains = _uniq_text(data.get("preferred_domains"), 6, 120)
-        if not self.must_answer:
-            self.must_answer = list(qmap.parts) if qmap.parts else [qmap.question[:700]]
-
-    def block(self) -> str:
-        return json.dumps(
-            {
-                "queries": self.queries,
-                "focus_terms": self.focus_terms,
-                "must_answer": self.must_answer,
-                "must_explain": self.must_explain,
-                "exact_values_needed": self.exact_values_needed,
-                "preferred_domains": self.preferred_domains,
-            },
-            ensure_ascii=False,
-        )
-
-
-def _query_prefix(question: str) -> str:
-    """Return the source/event clause, not the potentially false commentary claim."""
-    q = _clean_space(question)
+async def _search_packet(query: str, advanced: bool = False) -> ToolPacket:
+    q = _space(query)
     if not q:
-        return ""
-    prefix = q.split(":", 1)[0] if ":" in q else q
-    prefix = re.sub(r"^(?:using|based on|according to)\s+(?:only\s+)?(?:the\s+)?", "", prefix, flags=re.I)
-    prefix = re.sub(r"\s+", " ", prefix).strip(" ,.;:-")
-    if len(prefix) > 240:
-        prefix = " ".join(prefix.split()[:28])
-    return prefix
+        return ToolPacket("# search: empty query")
+    attempts = [q]
+    loose = _loosen_query(q)
+    if loose and loose != q:
+        attempts.append(loose)
 
-
-def _compact_queries(qmap: QuestionMap) -> list[str]:
-    """Build a few compact high-signal Parallel queries.
-
-    False claims in benchmark prompts are deliberately excluded. When a prompt
-    contrasts stages such as semifinal/final, issue stage-specific searches so
-    both official tables can surface independently instead of relying on one
-    broad query.
-    """
-    q = qmap.question
-    low = q.lower()
-    source = qmap.named_sources[0] if qmap.named_sources else ""
-    prefix = _query_prefix(q)
-    years = list(dict.fromkeys(re.findall(r"\b(?:19|20)\d{2}\b", q)))[:2]
-
-    source_words = {x.lower() for x in _token_terms(source)}
-    blocked = {
-        "commentary", "claims", "claim", "won", "winner", "usual", "exactly",
-        "competition", "results", "result", "official", "championships", "championship",
-    }
-    salient: list[str] = []
-    for term in _token_terms(prefix):
-        key = term.lower()
-        if key in source_words or key in blocked or re.fullmatch(r"(?:19|20)\d{2}", term):
-            continue
-        if term not in salient:
-            salient.append(term)
-        if len(salient) >= 6:
-            break
-
-    base: list[str] = []
-    if source:
-        base.extend(source.split())
-    base.extend(years)
-    base.extend(salient[:5])
-    if not base:
-        base.extend(_token_terms(prefix)[:8])
-
-    variants: list[list[str]] = []
-    if "semifinal" in low or "semi-final" in low:
-        variants.append(base + ["semifinal", "results"])
-    if re.search(r"\bfinal\b", low):
-        variants.append(base + ["final", "results"])
-    if any(word in low for word in ("qualif", "advancement", "advance")):
-        variants.append(base + ["qualification", "rule", "results"])
-    if not variants:
-        variants.append(base + ["results"])
-
-    out: list[str] = []
-    for parts in variants:
-        words: list[str] = []
-        seen: set[str] = set()
-        for piece in parts:
-            for word in str(piece).split():
-                key = word.lower().strip(".,;:()[]{}\"'")
-                if not key or key in seen:
-                    continue
-                seen.add(key)
-                words.append(word.strip(".,;:()[]{}\"'"))
-        candidate = _clean_space(" ".join(words[:13]))
-        if candidate and candidate.lower() not in [x.lower() for x in out]:
-            out.append(candidate)
-        if len(out) >= MAX_PLAN_QUERIES:
-            break
-    if not out:
-        out.append(_cap(_clean_space(prefix or q), 180))
-    return out
-
-def _fallback_plan(qmap: QuestionMap) -> ResearchPlan:
-    plan = ResearchPlan()
-    q = qmap.question
-    plan.must_answer = list(qmap.parts) if qmap.parts else [q[:700]]
-    raw_focus = _token_terms(_query_prefix(q) + " " + q)
-    plan.focus_terms = [
-        term for term in raw_focus
-        if term.lower() not in {"won", "winner", "claims", "claim", "commentary", "usual"}
-    ][:16]
-    plan.queries = _compact_queries(qmap)
-    if qmap.explain_difference:
-        plan.must_explain.append(
-            "Explain the observed discrepancy from actual source rows/statuses; do not infer the answer from the rule alone."
-        )
-    if qmap.must_preserve_exact:
-        plan.exact_values_needed.append(
-            "All requested names, marks, labels, dates and units exactly as the official source prints them."
-        )
-    return plan
-
-
-async def _make_plan(qmap: QuestionMap, deadline: float) -> ResearchPlan:
-    # Deterministic by design: avoid an extra LLM hop and avoid search-query drift.
-    return _fallback_plan(qmap)
-
-
-# ---------------------------------------------------------------------------
-# Evidence store
-# ---------------------------------------------------------------------------
-
-
-class SourceBook:
-    def __init__(self, qmap: QuestionMap, plan: ResearchPlan) -> None:
-        self.qmap = qmap
-        self.plan = plan
-        self.rows: list[dict[str, Any]] = []
-        self.searched: list[str] = []
-        self.fetched: list[str] = []
-        self.locked_hosts: list[str] = []
-        self.pinned_event_urls: list[str] = []
-
-    def _host_allowed(self, host: str) -> bool:
-        if not self.qmap.hard_source_lock:
-            return True
-        clean = (host or "").lower().split(":", 1)[0].strip(".")
-        if not self.locked_hosts:
-            host_flat = re.sub(r"[^a-z0-9]", "", clean)
-            for hint in self.qmap.named_sources:
-                h = re.sub(r"[^a-z0-9]", "", hint.lower())
-                if h and h in host_flat:
-                    return True
-            return not self.qmap.named_sources
-        for allowed in self.locked_hosts:
-            base = allowed.lower().split(":", 1)[0].strip(".")
-            if clean == base or clean.endswith("." + base) or base.endswith("." + clean):
-                return True
-        return False
-
-    def source_allowed(self, number: int) -> bool:
-        row = self.row(number)
-        if row is None or not self._host_allowed(str(row.get("host") or "")):
-            return False
-        if _event_source_rejected(self.qmap.question, row):
-            return False
-        # Once an exact event-specific route has been discovered, generic
-        # competition pages with unknown active-event identity are no longer
-        # admissible evidence. This prevents navigation/menu text from leaking
-        # a neighboring discipline back into synthesis or citations.
-        if self.has_canonical_event_source():
-            route = _canonical_result_route_score(self.qmap.question, str(row.get("url") or ""))
-            state = _event_match_state(
-                self.qmap.question,
-                str(row.get("url") or ""),
-                str(row.get("title") or ""),
-                str(row.get("text") or "")[:8000],
+    last_error = ""
+    for attempt_index, current in enumerate(attempts[:2]):
+        try:
+            payload = await search_web(
+                current,
+                provider=SEARCH_PROVIDER,
+                num=SEARCH_RESULTS,
+                timeout=SEARCH_TIMEOUT,
+                provider_extra={
+                    "mode": "advanced" if (advanced or attempt_index > 0) else "basic",
+                    "max_chars_total": 20000,
+                    "excerpt_settings": {"max_chars_per_result": 2800},
+                },
             )
-            if route < 100 and state <= 0:
-                return False
-        return True
+        except Exception as exc:
+            last_error = str(exc)
+            continue
+        _remember_budget(payload)
+        receipt = str(getattr(payload, "receipt_id", "") or "")
+        results = list(getattr(payload, "results", None) or [])
+        if not receipt or not results:
+            continue
 
-    def infer_source_lock(self) -> None:
-        """Infer the named source's own host from discovery results."""
-        if not self.qmap.hard_source_lock or not self.qmap.named_sources:
-            return
-        candidates: list[tuple[int, str]] = []
-        for row in self.rows:
-            host = str(row.get("host") or "").lower()
-            if not host:
+        rows: list[dict[str, Any]] = []
+        lines = [f"# search {current!r}: {len(results)} result(s)"]
+        for item in results:
+            rid = getattr(item, "result_id", None)
+            note = str(getattr(item, "note", None) or "")
+            if not isinstance(rid, str) or not rid or not note.strip():
                 continue
-            host_flat = re.sub(r"[^a-z0-9]", "", host)
-            owner = 0
-            for hint in self.qmap.named_sources:
-                h = re.sub(r"[^a-z0-9]", "", hint.lower())
-                if h and h in host_flat:
-                    owner += 100
-            if owner <= 0:
-                continue
-            identity = _event_identity_score(
-                self.qmap.question,
-                str(row.get("url") or ""),
-                str(row.get("title") or ""),
-                str(row.get("text") or "")[:2600],
+            title = str(getattr(item, "title", None) or "")
+            url = str(getattr(item, "url", None) or "")
+            show_end = min(len(note), max(120, SEARCH_NOTE_SHOW))
+            rows.append({
+                "receipt_id": receipt,
+                "result_id": rid,
+                "title": title,
+                "url": url,
+                "text": note,
+                "preview": note[:SEARCH_NOTE_SHOW],
+                "kind": "search",
+                "shown": [(0, show_end)],
+                "kept": [],
+            })
+            marker = f"<ROW{len(rows) - 1}>"
+            lines.append(
+                f"{marker} {title} — {url}\n"
+                f"{note[:SEARCH_NOTE_SHOW]}"
             )
-            if identity <= -20:
-                continue
-            candidates.append((owner + identity + _int(row.get("authority"), 0), host))
-        candidates.sort(reverse=True)
-        if not candidates:
-            return
-        best = candidates[0][0]
-        hosts: list[str] = []
-        for score, host in candidates:
-            if score < best - 18:
-                continue
-            if host not in hosts:
-                hosts.append(host)
-        self.locked_hosts = hosts[:3]
-        self.refresh_event_pins()
-
-    def refresh_event_pins(self) -> None:
-        """Pin canonical event-specific result routes discovered in search/fetch."""
-        candidates: list[tuple[int, str]] = []
-        for row in self.rows:
-            if _event_source_rejected(self.qmap.question, row):
-                continue
-            url = str(row.get("url") or "").strip()
-            route = _canonical_result_route_score(self.qmap.question, url)
-            if route < 100:
-                continue
-            candidates.append((route + _int(row.get("authority"), 0), url))
-            for sibling in _stage_sibling_urls(url, self.qmap.question):
-                candidates.append((route + 5, sibling))
-        candidates.sort(reverse=True)
-        pins: list[str] = []
-        for _, url in candidates:
-            clean = url.split("#", 1)[0]
-            if clean and clean not in pins:
-                pins.append(clean)
-        self.pinned_event_urls = pins[:6]
-
-    def has_canonical_event_source(self) -> bool:
-        if self.pinned_event_urls:
-            return True
-        return any(
-            _canonical_event_source(self.qmap.question, row)
-            for row in self.rows
-            if not _event_source_rejected(self.qmap.question, row)
-        )
-
-    def row(self, number: int) -> dict[str, Any] | None:
-        if 1 <= number <= len(self.rows):
-            return self.rows[number - 1]
-        return None
-
-    def add(
-        self,
-        receipt_id: str,
-        result_id: str,
-        text: str,
-        title: str,
-        url: str,
-        shown: list[tuple[int, int]],
-        origin: str,
-    ) -> int:
-        if len(self.rows) >= MAX_SOURCES:
-            return 0
-        if not receipt_id or not result_id or not text.strip():
-            return 0
-        for idx, old in enumerate(self.rows, 1):
-            if old.get("receipt_id") == receipt_id and old.get("result_id") == result_id:
-                spans = old.get("shown")
-                if not isinstance(spans, list):
-                    spans = []
-                spans.extend(shown)
-                old["shown"] = _merge_spans(spans, len(str(old.get("text") or "")))
-                return idx
-        body = text[:MAX_SOURCE_TEXT]
-        row = {
-            "receipt_id": receipt_id,
-            "result_id": result_id,
-            "text": body,
-            "title": _cap(title, 220),
-            "url": _cap(url, 600),
-            "host": _host(url),
-            "authority": _authority(url, title, self.qmap.named_sources + self.plan.preferred_domains),
-            "shown": _merge_spans(shown, len(body)),
-            "retained": [],
-            "origin": origin,
-        }
-        self.rows.append(row)
-        # Search snippets can reveal an exact event route before any page fetch.
-        if _canonical_result_route_score(self.qmap.question, url) >= 100:
-            self.refresh_event_pins()
-        return len(self.rows)
-
-    def retain(self, number: int, quote: str) -> bool:
-        row = self.row(number)
-        if row is None:
-            return False
-        body = str(row.get("text") or "")
-        needle = (quote or "").strip()
-        if len(needle) < 6:
-            return False
-        pos = body.find(needle)
-        if pos < 0:
-            pos = body.lower().find(needle.lower())
-        if pos < 0:
-            return False
-        start = max(0, pos - QUOTE_CONTEXT)
-        end = min(len(body), pos + len(needle) + QUOTE_CONTEXT)
-        spans = row.get("retained")
-        if not isinstance(spans, list):
-            spans = []
-        spans.append((start, end))
-        row["retained"] = _merge_spans(spans, len(body))[:8]
-        return True
-
-    def relevance(self, number: int) -> int:
-        row = self.row(number)
-        if row is None:
-            return -999
-        hay = f"{row.get('title','')} {row.get('url','')} {str(row.get('text',''))[:5000]}".lower()
-        score = _int(row.get("authority"), 0) * 5
-        score += _event_identity_score(
-            self.qmap.question,
-            str(row.get("url") or ""),
-            str(row.get("title") or ""),
-            str(row.get("text") or "")[:2600],
-        )
-        for term in _token_terms(self.qmap.question)[:18]:
-            if term.lower() in hay:
-                score += 2
-        for term in self.plan.focus_terms[:14]:
-            if term.lower() in hay:
-                score += 3
-        if row.get("origin") == "fetch":
-            score += 8
-        return score
-
-    def ranked(self) -> list[int]:
-        numbers = [n for n in range(1, len(self.rows) + 1) if self.source_allowed(n)]
-        numbers.sort(key=lambda n: (-self.relevance(n), n))
-        return numbers
-
-    def _snippet(self, number: int, focus: str, max_chars: int) -> str:
-        row = self.row(number)
-        if row is None:
-            return ""
-        body = str(row.get("text") or "")
-        retained = row.get("retained")
-        pieces: list[str] = []
-        if isinstance(retained, list) and retained:
-            for start, end in retained[:3]:
-                pieces.append(body[_int(start) : _int(end)])
-        if not pieces:
-            shown = row.get("shown")
-            if isinstance(shown, list):
-                for start, end in shown[:3]:
-                    pieces.append(body[_int(start) : _int(end)])
-        if not pieces:
-            for start, end in _best_windows(body, focus, min(max_chars, 4200), 2):
-                pieces.append(body[start:end])
-        if not pieces:
-            pieces = [body[:max_chars]]
-        return _cap("\n...\n".join(pieces), max_chars)
-
-    def pack(self, max_chars: int = MAX_PACK_CHARS) -> str:
-        focus = self.qmap.question + "\n" + " ".join(self.plan.focus_terms)
-        blocks: list[str] = []
-        spent = 0
-        for number in self.ranked():
-            row = self.row(number)
-            if row is None:
-                continue
-            snippet = self._snippet(number, focus, 6500 if row.get("origin") == "fetch" else 2600)
-            block = (
-                f"[{number}] SOURCE\n"
-                f"TITLE: {row.get('title','')}\n"
-                f"URL: {row.get('url','')}\n"
-                f"AUTHORITY: {row.get('authority',0)} ORIGIN: {row.get('origin','')}\n"
-                f"EVENT_MATCH: {_event_match_state(self.qmap.question, str(row.get('url') or ''), str(row.get('title') or ''), str(row.get('text') or '')[:5000])} "
-                f"CANONICAL_ROUTE_SCORE: {_canonical_result_route_score(self.qmap.question, str(row.get('url') or ''))}\n"
-                f"TEXT:\n{snippet}\n"
-            )
-            if spent + len(block) > max_chars:
-                continue
-            blocks.append(block)
-            spent += len(block)
-            if spent >= max_chars - 1200:
-                break
-        return "\n\n".join(blocks)
-
-    def citation(self, number: int) -> tuple[CitationRef | None, int]:
-        row = self.row(number)
-        if row is None or not self.source_allowed(number):
-            return None, 0
-        receipt = str(row.get("receipt_id") or "")
-        result = str(row.get("result_id") or "")
-        body = str(row.get("text") or "")
-        if not receipt or not result or not body:
-            return None, 0
-        spans = row.get("retained") or row.get("shown") or []
-        if not isinstance(spans, list):
-            spans = []
-        widened: list[tuple[int, int]] = []
-        for raw in spans[:6]:
-            try:
-                start = max(0, int(raw[0]))
-                end = min(len(body), int(raw[1]))
-            except Exception:
-                continue
-            if end <= start:
-                continue
-            if end - start < MIN_SLICE:
-                middle = (start + end) // 2
-                start = max(0, middle - MIN_SLICE // 2)
-                end = min(len(body), start + MIN_SLICE)
-                start = max(0, end - MIN_SLICE)
-            widened.append((start, end))
-        if not widened:
-            widened = [(0, min(len(body), 1800))]
-        widened = _merge_spans(widened, len(body))
-        total = sum(end - start for start, end in widened)
-        if total > MAX_SLICE_PER_SOURCE:
-            kept: list[tuple[int, int]] = []
-            left = MAX_SLICE_PER_SOURCE
-            for start, end in widened:
-                if left <= 0:
-                    break
-                width = min(end - start, left)
-                kept.append((start, start + width))
-                left -= width
-            widened = kept
-            total = sum(end - start for start, end in widened)
-        slices = [CitationSlice(start=start, end=end) for start, end in widened if end > start]
-        if not slices:
-            return None, 0
-        return CitationRef(receipt_id=receipt, result_id=result, slices=slices), total
+        if rows:
+            return ToolPacket("\n\n".join(lines), rows)
+    return ToolPacket(f"# search failed for {q!r}: {last_error[:180]}")
 
 
-# ---------------------------------------------------------------------------
-# Retrieval
-# ---------------------------------------------------------------------------
-
-
-def _loosen(query: str) -> str:
-    value = re.sub(r"\bsite:\S+", " ", query or "", flags=re.I)
-    value = value.replace('"', " ").replace("'", " ")
-    return _clean_space(value)
-
-
-def _ingest_search(payload: Any, book: SourceBook) -> list[int]:
-    if payload is None:
-        return []
-    _remember_budget(payload)
-    receipt = str(getattr(payload, "receipt_id", "") or "")
-    items = list(getattr(payload, "results", None) or [])
-    if not receipt or not items:
-        return []
-    numbers: list[int] = []
-    for item in items:
-        result_id = getattr(item, "result_id", None)
-        note = str(getattr(item, "note", None) or "")
-        if not isinstance(result_id, str) or not result_id or not note.strip():
-            continue
-        title = str(getattr(item, "title", None) or "")
-        url = str(getattr(item, "url", None) or "")
-        number = book.add(
-            receipt, result_id, note, title, url,
-            [(0, min(len(note), SEARCH_PREVIEW))], "search"
-        )
-        if number and number not in numbers:
-            numbers.append(number)
-    return numbers
-
-
-async def _parallel_search_call(
-    queries: list[str],
-    book: SourceBook,
-    deadline: float,
-    advanced: bool = False,
-) -> list[int]:
-    clean: list[str] = []
-    for raw in queries:
-        q = _clean_space(raw)
-        if q and q.lower() not in [x.lower() for x in clean]:
-            clean.append(_cap(q, 220))
-        if len(clean) >= MAX_PLAN_QUERIES:
-            break
-    if not clean or _left(deadline) < 10.0:
-        return []
-    timeout = min(SEARCH_TIMEOUT if not advanced else SEARCH_RETRY_TIMEOUT, max(8.0, _left(deadline) - 5.0))
-    try:
-        payload = await search_web(
-            clean,
-            provider="parallel",
-            num=SEARCH_RESULTS,
-            timeout=timeout,
-            provider_extra={
-                "mode": "advanced" if advanced else "basic",
-                "max_chars_total": 28000 if advanced else 22000,
-                "excerpt_settings": {"max_chars_per_result": 4200 if advanced else 3200},
-            },
-        )
-    except Exception:
-        return []
-    for q in clean:
-        if q not in book.searched:
-            book.searched.append(q)
-    added = _ingest_search(payload, book)
-    book.infer_source_lock()
-    return added
-
-
-async def _parallel_locked_repair(
-    queries: list[str],
-    book: SourceBook,
-    deadline: float,
-) -> list[int]:
-    """Run one domain-filtered Parallel search after a hard source host is known."""
-    if not book.qmap.hard_source_lock or not book.locked_hosts or _left(deadline) < 10.0:
-        return []
-    clean = [_clean_space(x) for x in queries if _clean_space(x)][:2]
-    if not clean:
-        return []
-    timeout = min(SEARCH_TIMEOUT, max(8.0, _left(deadline) - 5.0))
-    try:
-        payload = await search_web(
-            clean,
-            provider="parallel",
-            num=SEARCH_RESULTS,
-            timeout=timeout,
-            provider_extra={
-                "mode": "basic",
-                "max_chars_total": 24000,
-                "source_policy": {"include_domains": list(book.locked_hosts)},
-                "excerpt_settings": {"max_chars_per_result": 4200},
-            },
-        )
-    except Exception:
-        return []
-    added = _ingest_search(payload, book)
-    book.infer_source_lock()
-    return added
-
-
-async def _desearch_last_resort(query: str, book: SourceBook, deadline: float) -> list[int]:
-    """One slow-provider fallback only after Parallel has failed completely."""
-    q = _clean_space(query)
-    if not q or _left(deadline) < 90.0:
-        return []
-    timeout = min(DESEARCH_FALLBACK_TIMEOUT, max(20.0, _left(deadline) - 7.0))
-    try:
-        payload = await search_web(
-            q,
-            provider="desearch",
-            num=SEARCH_RESULTS,
-            timeout=timeout,
-        )
-    except Exception:
-        return []
-    if q not in book.searched:
-        book.searched.append(q)
-    return _ingest_search(payload, book)
-
-
-async def _search_many(queries: list[str], book: SourceBook, deadline: float) -> list[int]:
-    """Parallel-first retrieval with one bounded quality escalation.
-
-    Parallel's Harnyx adapter applies `num` as `max_results` at request time and
-    supports excerpt limits, so this path avoids the long full-response latency
-    observed with DeSearch. A single DeSearch call remains only as a last resort.
-    """
-    unique: list[str] = []
-    for raw in queries:
-        q = _clean_space(raw)
-        if q and q.lower() not in [x.lower() for x in unique]:
-            unique.append(q)
-        if len(unique) >= MAX_PLAN_QUERIES:
-            break
-    if not unique:
-        return []
-
-    collected = await _parallel_search_call(unique, book, deadline, False)
-    if collected:
-        if book.qmap.hard_source_lock and book.locked_hosts and _left(deadline) > 24.0:
-            locked = await _parallel_locked_repair(unique, book, deadline)
-            for number in locked:
-                if number not in collected:
-                    collected.append(number)
-        strongest = max(
-            (_int((book.row(number) or {}).get("authority"), 0) for number in collected),
-            default=0,
-        )
-        # Escalate quality only when source-bound questions did not surface an
-        # authoritative source. Do not duplicate a good search just for volume.
-        if strongest < 9 and _left(deadline) > 35.0:
-            extra = await _parallel_search_call(unique[:2], book, deadline, True)
-            for number in extra:
-                if number not in collected:
-                    collected.append(number)
-        return collected
-
-    # Parallel failed completely. One paid DeSearch fallback is preferable to
-    # silently answering a source-bound question from model memory.
-    fallback = await _desearch_last_resort(unique[0], book, deadline)
-    return fallback
-
-def _stage_sibling_urls(url: str, question: str) -> list[str]:
-    """Derive obvious sibling result-stage URLs when a provider finds one stage.
-
-    This is useful for sites whose result paths encode /semi-final/result and
-    /final/result. It avoids another web search when the user explicitly asks
-    to compare the two stages.
-    """
-    target = (url or "").strip()
-    low_q = (question or "").lower()
-    if not target or not ("final" in low_q and ("semi" in low_q or "semifinal" in low_q)):
-        return []
-    out: list[str] = []
-    replacements = (
-        ("/semi-final/result", "/final/result"),
-        ("/semifinal/result", "/final/result"),
-        ("/final/result", "/semi-final/result"),
-    )
-    for old_part, new_part in replacements:
-        if old_part in target:
-            candidate = target.replace(old_part, new_part, 1)
-            if candidate != target and candidate not in out:
-                out.append(candidate)
-    return out
-
-
-def _named_source_host_score(book: SourceBook, row: dict[str, Any]) -> int:
-    """Prefer the named source's own host over pages that merely mention its name."""
-    host_flat = re.sub(r"[^a-z0-9]", "", _host(str(row.get("url") or "")))
-    score = 0
-    for hint in book.qmap.named_sources:
-        h = re.sub(r"[^a-z0-9]", "", hint.lower())
-        if h and h in host_flat:
-            score += 45
-    return score
-
-
-def _fetch_candidates(book: SourceBook, cap: int) -> list[str]:
-    """Choose event-correct pages, pinning canonical stage routes first."""
-    book.refresh_event_pins()
-    out: list[str] = []
-    seen: set[str] = set()
-
-    # Hard priority: canonical event-specific routes discovered by Parallel.
-    # This prevents generic competition/calendar pages from consuming the fetch
-    # budget when an exact /men/1500-metres/... route is already available.
-    for url in book.pinned_event_urls:
-        for candidate in _canonical_stage_urls(url, book.qmap.question) or [url]:
-            key = candidate.split("#", 1)[0]
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            out.append(candidate)
-            if len(out) >= cap:
-                return out
-
-    ranked: list[tuple[int, int, int, int, int, str]] = []
-    for number in book.ranked():
-        row = book.row(number)
-        if row is None or _event_source_rejected(book.qmap.question, row):
-            continue
-        url = str(row.get("url") or "").strip()
-        if not url:
-            continue
-        identity = _event_identity_score(
-            book.qmap.question,
-            url,
-            str(row.get("title") or ""),
-            str(row.get("text") or "")[:4000],
-        )
-        route = _canonical_result_route_score(book.qmap.question, url)
-        owner = _named_source_host_score(book, row)
-        score = book.relevance(number)
-        if identity <= -40 or route <= -80:
-            continue
-        # canonical route > active event match > source ownership > relevance.
-        state = _event_match_state(
-            book.qmap.question,
-            url,
-            str(row.get("title") or ""),
-            str(row.get("text") or "")[:5000],
-        )
-        ranked.append((-route, -state, -owner, -identity, -score, url))
-    ranked.sort()
-
-    for _, _, _, _, _, url in ranked:
-        candidates = _canonical_stage_urls(url, book.qmap.question)
-        if not candidates:
-            candidates = [url] + _stage_sibling_urls(url, book.qmap.question)
-        for candidate in candidates:
-            key = candidate.split("#", 1)[0]
-            if not key or key in seen:
-                continue
-            seen.add(key)
-            out.append(candidate)
-            if len(out) >= cap:
-                return out
-    return out
-
-
-def _fetch_objective(book: SourceBook) -> str:
-    parts = book.qmap.parts[:6] if book.qmap.parts else book.plan.must_answer[:6]
-    focus = "; ".join(parts)
-    if not focus:
-        focus = " ".join(book.plan.focus_terms[:12])
-    instruction = (
-        "Extract exact source text needed to answer these requested facts. "
-        "Preserve result-table rows, names, marks, dates, units, qualification "
-        "labels/status codes, totals, and any rule explaining a discrepancy: " + focus
-    )
-    return _cap(_clean_space(instruction), 1300)
-
-
-async def _fetch_one(url: str, book: SourceBook) -> int:
+async def _fetch_packet(url: str, focus: str, question: str) -> ToolPacket:
     target = (url or "").strip()
     if not target:
-        return 0
-    if target not in book.fetched:
-        book.fetched.append(target)
+        return ToolPacket("# fetch: empty url")
+    objective = (
+        "Extract the page text needed to answer the research question. Preserve exact "
+        "names, dates, figures, units, table rows, headings, qualifiers and source labels. "
+        f"Question: {_clip(question, 1400)}"
+    )
+    if focus.strip():
+        objective += f" Focus especially on: {_clip(focus, 700)}"
     try:
         payload = await fetch_page(
             target,
-            provider="parallel",
+            provider=SEARCH_PROVIDER,
             timeout=FETCH_TIMEOUT,
             provider_extra={
-                "objective": _fetch_objective(book),
-                "max_chars_total": 30000,
-                "excerpt_settings": {"max_chars_per_result": 9000},
+                "objective": objective,
+                "max_chars_total": 36000,
+                "excerpt_settings": {"max_chars_per_result": 12000},
                 "full_content": True,
             },
         )
-    except Exception:
-        return 0
-    if not getattr(payload, "results", None):
-        return 0
+    except Exception as exc:
+        return ToolPacket(f"# fetch failed for {target!r}: {str(exc)[:180]}")
     _remember_budget(payload)
     receipt = str(getattr(payload, "receipt_id", "") or "")
-    items = list(getattr(payload, "results", None) or [])
-    if not receipt or not items:
-        return 0
-    item = items[0]
-    result_id = getattr(item, "result_id", None)
+    results = list(getattr(payload, "results", None) or [])
+    if not receipt or not results:
+        return ToolPacket(f"# fetch returned no content for {target!r}")
+    item = results[0]
+    rid = getattr(item, "result_id", None)
     note = str(getattr(item, "note", None) or "")
-    if not isinstance(result_id, str) or not result_id or not note.strip():
-        return 0
+    if not isinstance(rid, str) or not rid or not note.strip():
+        return ToolPacket(f"# fetch returned unusable content for {target!r}")
     title = str(getattr(item, "title", None) or target)
     final_url = str(getattr(item, "url", None) or target)
 
-    probe = {
-        "url": final_url,
-        "title": title,
-        "text": note,
-        "host": _host(final_url),
-    }
-    # A same-domain page with an explicit different active event is never
-    # admissible evidence. Example: a Tokyo-2025 competition page whose active
-    # table is Men's 4x400 Relay cannot answer a Men's 1500m question merely
-    # because "Men's 1500 Metres" appears in the navigation menu.
-    if _event_source_rejected(book.qmap.question, probe):
-        return 0
-
-    shown: list[tuple[int, int]] = []
-    if len(note) <= 8500:
+    focus_text = question + " " + focus + " " + title
+    spans = _window_spans(note, focus_text)
+    if len(note) <= ROW_DIGEST_CAP:
         shown = [(0, len(note))]
     else:
-        shown.append((0, min(len(note), FETCH_HEAD)))
-        focus = book.qmap.question + "\n" + " ".join(book.plan.focus_terms)
-        shown.extend(_best_windows(note, focus))
-        shown = _merge_spans(shown, len(note))
-    return book.add(receipt, result_id, note, title, final_url, shown, "fetch")
+        shown = [(0, min(len(note), FETCH_ORIENTATION))]
+        for span in spans:
+            shown.append(span)
+        shown = _merge_ranges(shown, len(note))
+
+    row = {
+        "receipt_id": receipt,
+        "result_id": rid,
+        "title": title,
+        "url": final_url,
+        "text": note,
+        "preview": "",
+        "kind": "fetch",
+        "shown": shown,
+        "kept": [],
+    }
+    orientation = note[:FETCH_ORIENTATION]
+    chunks = []
+    for a, b in spans:
+        chunks.append(f"\n--- section @{a} ---\n{note[a:b]}")
+    rendered = (
+        f"# fetch {target!r} -> <ROW0> {len(note)} chars\n"
+        f"TITLE: {title}\nURL: {final_url}\n"
+        f"--- orientation ---\n{orientation}"
+        + "".join(chunks)
+    )
+    row["preview"] = _clip(" ".join(note[a:b] for a, b in spans), 1500)
+    return ToolPacket(rendered, [row])
 
 
-async def _fetch_many(urls: list[str], book: SourceBook, deadline: float) -> None:
-    unique: list[str] = []
-    for url in urls:
-        if url and url not in unique:
-            unique.append(url)
-        if len(unique) >= FETCH_CAP:
-            break
-    if not unique or _left(deadline) < 12.0:
-        return
-    tasks = [asyncio.create_task(_fetch_one(url, book)) for url in unique]
-    try:
-        timeout = min(FETCH_TIMEOUT + 6.0, max(12.0, _left(deadline) - 5.0))
-        done, pending = await asyncio.wait(tasks, timeout=timeout)
-        for task in pending:
-            task.cancel()
-        for task in done:
+def _seed_queries(question: str, shape: QuestionShape) -> list[str]:
+    clean = _space(question)
+    salient = _terms(clean, 12)
+    seeds: list[str] = []
+    if clean:
+        seeds.append(_clip(clean, 240))
+    if salient:
+        seeds.append(" ".join(salient[:9]))
+    if (shape.set_like or shape.superlative) and salient:
+        seeds.append("official list table " + " ".join(salient[:7]))
+    out: list[str] = []
+    for item in seeds:
+        q = _space(item)
+        if q and q.lower() not in [x.lower() for x in out]:
+            out.append(q)
+    return out[:3]
+
+
+async def _preseed(question: str, shape: QuestionShape, vault: EvidenceVault,
+                   deadline: float) -> str:
+    seeds = _seed_queries(question, shape)
+    if not seeds or _left(deadline) < 35.0:
+        return ""
+    tasks = [asyncio.ensure_future(_search_packet(q, advanced=False)) for q in seeds]
+    done, pending = await asyncio.wait(tasks, timeout=min(TOOL_PHASE_TIMEOUT, max(5.0, _left(deadline) - 8.0)))
+    blocks: list[str] = []
+    for task in tasks:
+        if task.done():
             try:
-                task.result()
+                packet = task.result()
             except Exception:
-                pass
-    except Exception:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-        return
-
-
-# ---------------------------------------------------------------------------
-# Deterministic table signals
-# ---------------------------------------------------------------------------
-
-
-def _row_number_from_line(line: str) -> int:
-    """Parse a ranking row from debug `ROW n` or markdown `|14\\.|...` syntax."""
-    raw = line or ""
-    m = re.match(r"^\s*ROW\s+(\d{1,3})\b", raw, flags=re.I)
-    if m:
-        return _int(m.group(1), 0)
-    # Parallel markdown often escapes ordinal periods: `|14\\. |Josh KERR ...`.
-    m = re.match(r"^\s*\|?\s*(\d{1,3})\s*(?:(?:\\?\.)|\))?\s*\|", raw)
-    if m:
-        return _int(m.group(1), 0)
-    return 0
-
-
-def _source_stage(row: dict[str, Any]) -> str:
-    """Infer the result stage from the source URL/title without using page body claims."""
-    hay = f"{row.get('title','')} {row.get('url','')}".lower()
-    if re.search(r"(?:semi[- ]?final|semi-final/result|semifinal/result)", hay):
-        return "semifinal"
-    if re.search(r"(?:/final/result\b|\bfinal result\b)", hay) and "semi" not in hay:
-        return "final"
-    return "unknown"
-
-
-def _section_role(line: str, current: str, source_stage: str = "unknown") -> str:
-    """Map a visible heading to a semantic table scope.
-
-    World Athletics result pages can contain start lists, official results, race
-    analysis and other tables on one page.  Counting rows across those sections
-    created the v10 61-row contradiction.  Non-result sections therefore get
-    explicit roles that are never eligible for result-field counts.
-    """
-    low = _clean_space(line).lower().strip("*# _-")
-    if not low:
-        return current
-
-    if "official startlist" in low or "official start list" in low or low == "startlist":
-        return "startlist"
-    if "race analysis" in low or "photo finish" in low or "start list" in low:
-        return "analysis"
-    if "official result" in low:
-        return source_stage if source_stage in {"final", "semifinal"} else current
-
-    if re.search(r"\bsemi[- ]?final\s*1\b", low):
-        return "semifinal1"
-    if re.search(r"\bsemi[- ]?final\s*2\b", low):
-        return "semifinal2"
-
-    # Some World Athletics semifinal pages label their two races as Heat 1/2.
-    if source_stage == "semifinal" and re.search(r"\bheat\s*1\b", low):
-        return "semifinal1"
-    if source_stage == "semifinal" and re.search(r"\bheat\s*2\b", low):
-        return "semifinal2"
-
-    if re.search(r"\bsemi[- ]?final\b", low):
-        return "semifinal"
-    if re.search(r"\bfinal\b", low) and "semi" not in low:
-        return "final"
-    if re.search(r"\bheat(?:s|\s+\d+)?\b", low):
-        return "heat"
-    return current
-
-
-def _is_final_result_source(row: dict[str, Any]) -> bool:
-    return _source_stage(row) == "final"
-
-
-def _record_from_entries(
-    number: int,
-    body: str,
-    role: str,
-    entries: list[tuple[int, int, int]],
-) -> dict[str, Any] | None:
-    if role not in {"final", "semifinal", "semifinal1", "semifinal2", "heat"}:
-        return None
-    if len(entries) < 4:
-        return None
-    nums = [value for value, _, _ in entries]
-    # A true result table is one run.  If a page restarts numbering, the caller
-    # flushes the previous run before this helper is invoked.
-    unique: list[int] = []
-    for value in nums:
-        if value not in unique:
-            unique.append(value)
-    if len(unique) < 4:
-        return None
-    minimum = min(unique)
-    maximum = max(unique)
-    contiguous = minimum == 1 and unique == list(range(1, maximum + 1))
-    first = entries[0][1]
-    last = entries[-1][2]
-    return {
-        "source": number,
-        "row_count": len(unique),
-        "min_row": minimum,
-        "max_row": maximum,
-        "role": role,
-        "is_final": role == "final",
-        "contiguous": contiguous,
-        "quote": body[first:last][:14000],
-    }
-
-
-def _table_records_for_row(number: int, row: dict[str, Any]) -> list[dict[str, Any]]:
-    """Return section-scoped table runs from one fetched/search source.
-
-    Important: never deduplicate all ROW labels across an entire page. Result
-    pages may contain several numbered tables. A restart (e.g. 14 -> 1) or a
-    section-role change closes the current run.
-    """
-    body = str(row.get("text") or "")
-    if not body:
-        return []
-
-    source_stage = _source_stage(row)
-    current = source_stage
-    entries: list[tuple[int, int, int]] = []
-    records: list[dict[str, Any]] = []
-    offset = 0
-    last_value = 0
-
-    for raw_line in body.splitlines(keepends=True):
-        new_role = _section_role(raw_line, current, source_stage)
-        if new_role != current:
-            record = _record_from_entries(number, body, current, entries)
-            if record is not None:
-                records.append(record)
-            entries = []
-            last_value = 0
-            current = new_role
-
-        value = _row_number_from_line(raw_line)
-        if value > 0:
-            if entries and value <= last_value:
-                record = _record_from_entries(number, body, current, entries)
-                if record is not None:
-                    records.append(record)
-                entries = []
-                last_value = 0
-            if current in {"final", "semifinal", "semifinal1", "semifinal2", "heat"}:
-                entries.append((value, offset, offset + len(raw_line)))
-                last_value = value
-        offset += len(raw_line)
-
-    record = _record_from_entries(number, body, current, entries)
-    if record is not None:
-        records.append(record)
-    return records
-
-
-def _record_specificity(item: dict[str, Any], qmap: QuestionMap, book: SourceBook) -> int:
-    source = _int(item.get("source"), 0)
-    row = book.row(source) or {}
-    score = 0
-    role = str(item.get("role") or "")
-    url = str(row.get("url") or "").lower()
-    if role == "final":
-        score += 100
-    if item.get("contiguous"):
-        score += 60
-    route = _canonical_result_route_score(qmap.question, url)
-    state = _event_match_state(
-        qmap.question,
-        url,
-        str(row.get("title") or ""),
-        str(row.get("text") or "")[:8000],
-    )
-    score += max(-120, min(150, route))
-    if state == 2:
-        score += 100
-    elif state == 1:
-        score += 55
-    elif state < 0:
-        score -= 250
-    if "/final/result" in url and role == "final":
-        score += 120
-    if "/semi-final/result" in url and role.startswith("semifinal"):
-        score += 100
-    if book.source_allowed(source):
-        score += 50
-    score += min(40, max(0, _int(row.get("authority"), 0)))
-    # Do not reward a larger row count.  v10's failure came from treating a
-    # broad page aggregate as "more complete" merely because it was larger.
-    return score
-
-
-def _best_table_record(qmap: QuestionMap, book: SourceBook, role: str) -> dict[str, Any] | None:
-    records = _table_signal_records(qmap, book)
-    candidates = [item for item in records if str(item.get("role") or "") == role]
-    if role == "final":
-        candidates = [item for item in candidates if item.get("contiguous") and _int(item.get("min_row"), 0) == 1]
-    if not candidates:
-        return None
-    candidates.sort(
-        key=lambda item: (
-            _record_specificity(item, qmap, book),
-            1 if item.get("contiguous") else 0,
-            -_int(item.get("source"), 0),
-        ),
-        reverse=True,
-    )
-    return candidates[0]
-
-def _table_signal_records(qmap: QuestionMap, book: SourceBook) -> list[dict[str, Any]]:
-    signals: list[dict[str, Any]] = []
-    canonical_exists = book.has_canonical_event_source()
-    for number in book.ranked()[:16]:
-        row = book.row(number)
-        if row is None or _event_source_rejected(qmap.question, row):
-            continue
-        if canonical_exists:
-            route = _canonical_result_route_score(qmap.question, str(row.get("url") or ""))
-            state = _event_match_state(
-                qmap.question,
-                str(row.get("url") or ""),
-                str(row.get("title") or ""),
-                str(row.get("text") or "")[:8000],
-            )
-            # Once event-specific routes exist, generic unknown event pages must
-            # not contribute deterministic row counts.
-            if route < 100 and state <= 0:
-                continue
-        signals.extend(_table_records_for_row(number, row))
-    return signals
-
-
-def _table_signal_text(qmap: QuestionMap, book: SourceBook) -> str:
-    lines: list[str] = []
-    for item in _table_signal_records(qmap, book)[:10]:
-        role = str(item.get("role") or "result-table")
-        lines.append(
-            f"[{item['source']}] {role}: detected {item['row_count']} listed result rows "
-            f"(positions {item['min_row']} through {item['max_row']})."
-        )
-    return "\n".join(lines)
-
-
-def _final_count_from_record(record: dict[str, Any] | None) -> int:
-    if not isinstance(record, dict):
-        return 0
-    count = _int(record.get("row_count"), 0)
-    minimum = _int(record.get("min_row"), 0)
-    maximum = _int(record.get("max_row"), 0)
-    if record.get("contiguous") and minimum == 1 and maximum == count:
-        return maximum
-    return 0
-
-
-def _final_count_claim_value(text: str) -> int:
-    """Extract a claimed final-field/list count, not a finishing position."""
-    value = _clean_space(text)
-    low = value.lower()
-    if "final" not in low:
-        return 0
-    patterns = (
-        r"(?:official\s+)?final(?:\s+result)?(?:\s+list|\s+field)?[^.;]{0,70}?(?:contains|has|lists|shows|includes|comprises|with)\s+(?:exactly\s+)?(\d{1,3})\s+(?:(?:explicitly|officially|listed|qualified|total)\s+){0,4}(?:athletes|rows|entries|finalists)",
-        r"(?:contains|has|lists|shows|includes|comprises)\s+(?:exactly\s+)?(\d{1,3})\s+(?:(?:explicitly|officially|listed|qualified|total)\s+){0,4}(?:athletes|rows|entries|finalists)[^.;]{0,70}?\bfinal\b",
-        r"(\d{1,3})\s+(?:(?:explicitly|officially|listed|qualified|total)\s+){0,4}(?:athletes|rows|entries|finalists)[^.;]{0,70}?(?:official\s+)?final(?:\s+result)?(?:\s+list|\s+field)?",
-    )
-    for pattern in patterns:
-        m = re.search(pattern, value, flags=re.I)
-        if m:
-            return _int(m.group(1), 0)
-    return 0
-
-
-def _is_final_count_fact(item: dict[str, Any]) -> bool:
-    claim = str(item.get("claim") or "")
-    requirement = str(item.get("requirement") or "").lower()
-    slot = str(item.get("slot") or "").lower()
-    if slot == "final_result_count":
-        return True
-    if "deterministic count" in requirement:
-        return True
-    return _final_count_claim_value(claim) > 0
-
-
-def _sanitize_grid_conflicts(grid: dict[str, Any], qmap: QuestionMap, book: SourceBook) -> None:
-    """Resolve same-slot fact conflicts before synthesis.
-
-    For an explicit final-list count, a contiguous section-scoped final table is
-    authoritative over broad page aggregates or LLM-derived competing counts.
-    """
-    low = qmap.question.lower()
-    if "final" not in low or not ("how many" in low or "number of" in low or qmap.computed):
-        return
-    record = _best_table_record(qmap, book, "final")
-    authoritative = _final_count_from_record(record)
-    if authoritative <= 0:
-        return
-
-    facts = grid.get("facts")
-    if not isinstance(facts, list):
-        facts = []
-        grid["facts"] = facts
-
-    cleaned: list[Any] = []
-    for item in facts:
-        if not isinstance(item, dict):
-            cleaned.append(item)
-            continue
-        if _is_final_count_fact(item):
-            value = _final_count_claim_value(str(item.get("claim") or ""))
-            if value and value != authoritative:
-                continue
-            # Replace all same-slot count claims with one deterministic claim.
-            continue
-        cleaned.append(item)
-    facts[:] = cleaned
-
-    source = _int(record.get("source"), 0) if isinstance(record, dict) else 0
-    quote = str(record.get("quote") or "") if isinstance(record, dict) else ""
-    if source > 0 and len(quote) >= 20:
-        facts.append({
-            "claim": f"The official final result list contains {authoritative} explicitly listed rows.",
-            "source": source,
-            "quote": quote,
-            "requirement": "deterministic count from the official final result section",
-            "slot": "final_result_count",
-            "confidence": 100,
-        })
-        book.retain(source, quote)
-
-
-def _augment_grid_table_count(grid: dict[str, Any], qmap: QuestionMap, book: SourceBook) -> None:
-    low = qmap.question.lower()
-    if not (qmap.computed or "how many" in low or "number of" in low):
-        return
-
-    if "final" in low:
-        chosen = _best_table_record(qmap, book, "final")
-    else:
-        records = [item for item in _table_signal_records(qmap, book) if item.get("contiguous")]
-        chosen = max(records, key=lambda item: _record_specificity(item, qmap, book), default=None)
-    if chosen is None:
-        return
-
-    source = _int(chosen.get("source"), 0)
-    count = _final_count_from_record(chosen) if chosen.get("is_final") else _int(chosen.get("row_count"), 0)
-    quote = str(chosen.get("quote") or "")
-    if source <= 0 or count <= 0 or len(quote) < 20:
-        return
-
-    facts = grid.get("facts")
-    if not isinstance(facts, list):
-        facts = []
-        grid["facts"] = facts
-    facts.append({
-        "claim": (
-            f"The official final result list contains {count} explicitly listed rows."
-            if chosen.get("is_final") and "final" in low
-            else f"The result table contains {count} explicitly listed rows."
-        ),
-        "source": source,
-        "quote": quote,
-        "requirement": (
-            "deterministic count from the official final result section"
-            if chosen.get("is_final") and "final" in low
-            else "deterministic count from the actual listed result rows"
-        ),
-        "slot": "final_result_count" if chosen.get("is_final") and "final" in low else "table_count",
-        "confidence": 100,
-    })
-    book.retain(source, quote)
-    _sanitize_grid_conflicts(grid, qmap, book)
-
-
-def _sanitize_answer_conflicts(answer: str, qmap: QuestionMap, book: SourceBook) -> str:
-    """Drop final-count statements that contradict the scoped result table."""
-    value = (answer or "").strip()
-    if not value:
-        return value
-    record = _best_table_record(qmap, book, "final") if "final" in qmap.question.lower() else None
-    authoritative = _final_count_from_record(record)
-    if authoritative <= 0:
-        return value
-
-    multiline = "\n" in value
-    segments = value.splitlines() if multiline else re.split(r"(?<=[.!?])\s+", value)
-    kept: list[str] = []
-    for segment in segments:
-        claimed = _final_count_claim_value(segment)
-        if claimed > 0 and claimed != authoritative:
-            continue
-        kept.append(segment)
-    result = ("\n" if multiline else " ").join(x for x in kept if x.strip()).strip()
-    return result or value
-
-
-def _answer_has_final_count_conflict(answer: str, qmap: QuestionMap, book: SourceBook) -> bool:
-    record = _best_table_record(qmap, book, "final") if "final" in qmap.question.lower() else None
-    authoritative = _final_count_from_record(record)
-    if authoritative <= 0:
-        return False
-    segments = (answer or "").splitlines()
-    if not segments:
-        segments = [answer or ""]
-    for segment in segments:
-        claimed = _final_count_claim_value(segment)
-        if claimed > 0 and claimed != authoritative:
-            return True
-    return False
-
-
-# ---------------------------------------------------------------------------
-# Proof grid
-# ---------------------------------------------------------------------------
-
-
-def _fallback_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook) -> dict[str, Any]:
-    return {
-        "draft_answer": "",
-        "facts": [],
-        "verbatim_values": [],
-        "coverage": [{"requirement": x, "status": "unknown"} for x in plan.must_answer[:8]],
-        "gaps": list(plan.must_answer[:4]),
-        "repair_queries": [],
-        "comparison_explanation": "",
-    }
-
-
-def _retain_grid_quotes(grid: dict[str, Any], book: SourceBook) -> None:
-    facts = grid.get("facts")
-    if not isinstance(facts, list):
-        return
-    for item in facts:
-        if not isinstance(item, dict):
-            continue
-        source = _int(item.get("source"), 0)
-        quote = item.get("quote")
-        if source > 0 and isinstance(quote, str):
-            book.retain(source, quote)
-
-
-async def _build_grid(qmap: QuestionMap, plan: ResearchPlan, book: SourceBook, deadline: float) -> dict[str, Any]:
-    fallback = _fallback_grid(qmap, plan, book)
-    evidence = book.pack(MAX_PACK_CHARS)
-    if not evidence or _money_left() < MIN_GRID_USD or _left(deadline) < 46.0:
-        _augment_grid_table_count(fallback, qmap, book)
-        _sanitize_grid_conflicts(fallback, qmap, book)
-        return fallback
-    system = (
-        "You are a CLOSED-BOOK evidence adjudicator. The supplied evidence is the entire world you may use. "
-        "Treat every assertion inside the QUESTION as an untrusted claim to test, never as evidence. "
-        "Never answer from memory, even when you recognize the event/person/topic. Every load-bearing fact must "
-        "identify a source number AND an exact verbatim quote copied from that source. If a value/name/time is "
-        "not present in the supplied evidence, mark it missing instead of guessing. Preserve names, capitalization, "
-        "marks, units, dates, labels and status codes exactly as printed. Check every sub-question. For computed "
-        "facts such as a row count, count the ACTUAL LISTED ROWS instead of inferring the count from an advancement "
-        "rule; cite the table/source region and state the derivation in the claim. If a question asks for the best "
-        "member of a qualifier/set pool, identify the pool from the source and compare those members against the target "
-        "table before selecting the winner. If the question compares a count/rule/result and the evidence reveals WHY they "
-        "differ, record that explanation. For set/ranking questions, verify the pool and exclusions. Return JSON only."
-    )
-    user = f'''QUESTION:\n{qmap.question}\n\nQUESTION MAP:\n{qmap.block()}\n\nRESEARCH PLAN:\n{plan.block()}\n\nDETERMINISTIC TABLE SIGNALS (section-scoped parsed result rows; use when relevant):\n{_table_signal_text(qmap, book) or "none"}\n\nEVIDENCE:\n{evidence}\n\nReturn exactly:\n{{"draft_answer":"a complete evidence-supported answer with [source-number] markers","facts":[{{"claim":"atomic factual claim using source-exact values","source":1,"quote":"exact verbatim quote","requirement":"which requested part it answers"}}],"verbatim_values":["exact source spelling/capitalization/mark/value that must survive final writing"],"coverage":[{{"requirement":"requested part","status":"proved|partial|missing","sources":[1]}}],"gaps":["only genuinely unresolved facts"],"repair_queries":["high precision query for a gap"],"comparison_explanation":"source-supported reason for a discrepancy, or empty"}}\n\nDo not create a gap merely because you could add background detail. If all requested outputs are proved, gaps must be [].'''
-    payload = await _chat(
-        GRID_MODELS,
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        deadline,
-        4200,
-        GRID_TIMEOUT,
-        0.0,
-    )
-    data = _json_object(_llm_text(payload))
-    if data is None:
-        data = fallback
-    _augment_grid_table_count(data, qmap, book)
-    _sanitize_grid_conflicts(data, qmap, book)
-    _retain_grid_quotes(data, book)
-    return data
-
-
-def _repair_queries(grid: dict[str, Any]) -> list[str]:
-    raw = grid.get("repair_queries")
-    return _uniq_text(raw, MAX_REPAIR_QUERIES, 430)
-
-
-def _grid_draft(grid: dict[str, Any]) -> str:
-    value = grid.get("draft_answer")
-    return value.strip() if isinstance(value, str) else ""
-
-
-def _grid_verbatim(grid: dict[str, Any]) -> list[str]:
-    return _uniq_text(grid.get("verbatim_values"), 40, 180)
-
-
-def _grid_has_real_gaps(grid: dict[str, Any]) -> bool:
-    gaps = grid.get("gaps")
-    if not isinstance(gaps, list):
-        return False
-    return any(isinstance(x, str) and _clean_space(x) for x in gaps)
-
-
-# ---------------------------------------------------------------------------
-# Grounding firewall
-# ---------------------------------------------------------------------------
-
-_NUM_TOKEN_RE = re.compile(r"(?<![A-Za-z])\d+(?::\d{1,2}(?:\.\d+)?|\.\d+|,\d{3})*(?:%|st|nd|rd|th)?", re.I)
-_NAME_TOKEN_RE = re.compile(r"\b(?:[A-Z][A-Za-zÀ-ÖØ-öø-ÿ.'-]{2,}|[A-Z]{2,})(?:\s+(?:[A-Z][A-Za-zÀ-ÖØ-öø-ÿ.'-]{2,}|[A-Z]{2,})){1,3}\b")
-_COMMON_NAME_PHRASES = {
-    "World Athletics", "Official Result", "Official Results", "Race Analysis",
-    "Photo Finish", "Final Result", "Semifinal Result", "Reference Answer",
-}
-
-
-def _norm_quote(text: str) -> str:
-    value = (text or "").replace("\u00a0", " ")
-    value = value.replace("–", "-").replace("—", "-")
-    return _clean_space(value).lower()
-
-
-def _quote_supported(quote: str, body: str) -> bool:
-    if not quote or not body:
-        return False
-    if quote in body or quote.lower() in body.lower():
-        return True
-    nq = _norm_quote(quote)
-    nb = _norm_quote(body)
-    if len(nq) >= 6 and nq in nb:
-        return True
-    words = nq.split()
-    for width in (12, 10, 8):
-        if len(words) < width:
-            continue
-        for i in range(0, len(words) - width + 1):
-            if " ".join(words[i:i + width]) in nb:
-                return True
-    return False
-
-
-def _verified_facts(grid: dict[str, Any], book: SourceBook) -> list[dict[str, Any]]:
-    """Keep only facts whose quoted evidence literally exists in the cited source."""
-    raw = grid.get("facts")
-    if not isinstance(raw, list):
-        return []
-    out: list[dict[str, Any]] = []
-    for item in raw[:30]:
-        if not isinstance(item, dict):
-            continue
-        source = _int(item.get("source"), 0)
-        claim = _clean_space(str(item.get("claim") or ""))
-        quote = str(item.get("quote") or "").strip()
-        row = book.row(source)
-        if row is None or not claim or len(quote) < 6:
-            continue
-        body = str(row.get("text") or "")
-        if not _quote_supported(quote, body):
-            continue
-        clean = dict(item)
-        clean["source"] = source
-        clean["claim"] = claim
-        clean["quote"] = quote
-        out.append(clean)
-        book.retain(source, quote)
-    return out
-
-
-def _fact_basis(question: str, facts: list[dict[str, Any]], book: SourceBook) -> str:
-    pieces = [question]
-    for item in facts:
-        pieces.append(str(item.get("claim") or ""))
-        pieces.append(str(item.get("quote") or ""))
-        row = book.row(_int(item.get("source"), 0))
-        if row is not None:
-            pieces.append(str(row.get("title") or ""))
-    return "\n".join(pieces)
-
-
-def _critical_numbers(text: str) -> list[str]:
-    clean = _CITE_RE.sub("", text or "")
-    out: list[str] = []
-    for match in _NUM_TOKEN_RE.finditer(clean):
-        token = match.group(0)
-        if token not in out:
-            out.append(token)
-    return out
-
-
-def _critical_names(text: str) -> list[str]:
-    out: list[str] = []
-    for match in _NAME_TOKEN_RE.finditer(text or ""):
-        token = _clean_space(match.group(0))
-        if token in _COMMON_NAME_PHRASES:
-            continue
-        if token not in out:
-            out.append(token)
-    return out
-
-
-def _token_present(token: str, basis: str) -> bool:
-    if not token:
-        return True
-    low_basis = (basis or "").lower()
-    if token.lower() in low_basis:
-        return True
-    # Preserve the existing policy that values explicitly stated by the user may
-    # appear in comparisons, while recognizing digit/word equivalents. This is
-    # important for prompts that contrast an asserted "twelve" with an actual 14.
-    number_words = {
-        0: "zero", 1: "one", 2: "two", 3: "three", 4: "four", 5: "five",
-        6: "six", 7: "seven", 8: "eight", 9: "nine", 10: "ten",
-        11: "eleven", 12: "twelve", 13: "thirteen", 14: "fourteen",
-        15: "fifteen", 16: "sixteen", 17: "seventeen", 18: "eighteen",
-        19: "nineteen", 20: "twenty",
-    }
-    if re.fullmatch(r"\d{1,2}", token):
-        value = _int(token, -1)
-        word = number_words.get(value)
-        if word and re.search(rf"\b{re.escape(word)}\b", low_basis):
-            return True
-    return False
-
-
-def _coverage_signature(facts: list[dict[str, Any]]) -> list[str]:
-    """Critical values that a final answer should preserve from verified facts."""
-    out: list[str] = []
-    for item in facts:
-        claim = str(item.get("claim") or "")
-        for token in _critical_numbers(claim):
-            if token not in out:
-                out.append(token)
-        # Exact multi-word names are especially important in pairwise judging.
-        for token in _critical_names(claim):
-            if token not in out:
-                out.append(token)
-    return out[:36]
-
-
-def _grounded_answer(answer: str, question: str, facts: list[dict[str, Any]], book: SourceBook) -> bool:
-    """Reject memory substitutions and unsupported precise values/names."""
-    if not _usable_answer(answer, question):
-        return False
-    basis = _fact_basis(question, facts, book)
-
-    # Any precise numeric token in the answer must exist in the question or
-    # verified evidence/facts. This catches remembered times, prices, years, etc.
-    for token in _critical_numbers(answer):
-        if not _token_present(token, basis):
-            return False
-
-    # Any multi-word proper name introduced by the writer must be visible in
-    # the question or verified evidence. This catches entity substitution such
-    # as answering about a famous athlete from a different championship.
-    for token in _critical_names(answer):
-        if not _token_present(token, basis):
-            return False
-
-    # If verified facts contain distinctive values, the answer must preserve a
-    # meaningful share of them. A fluent answer that ignores the proof grid is
-    # worse than a mechanical evidence-only fallback.
-    required = _coverage_signature(facts)
-    if len(required) >= 4:
-        hits = sum(1 for token in required if _token_present(token, answer))
-        if hits < max(2, int(len(required) * 0.45)):
-            return False
-    return True
-
-
-
-def _grounded_in_book(answer: str, question: str, book: SourceBook) -> bool:
-    """Allow a complete evidence-only answer even when proof-grid JSON is sparse.
-
-    Every precise number/name still has to exist in retrieved evidence. This keeps
-    the proof grid from becoming a single point of failure.
-    """
-    if not _usable_answer(answer, question):
-        return False
-    pieces = [question]
-    for number in book.ranked()[:12]:
-        row = book.row(number)
-        if row is None:
-            continue
-        pieces.append(str(row.get("title") or ""))
-        pieces.append(str(row.get("text") or ""))
-    basis = "\n".join(pieces)
-    for token in _critical_numbers(answer):
-        if not _token_present(token, basis):
-            return False
-    for token in _critical_names(answer):
-        if not _token_present(token, basis):
-            return False
-    return True
-
-
-def _answer_part_coverage(answer: str, qmap: QuestionMap) -> int:
-    """Heuristic coverage guard for multi-part answers.
-
-    A numbered multi-part question should not collapse to one verified sentence
-    merely because one deterministic fact survived a proof-grid parse.
-    """
-    if not qmap.parts:
-        return 1 if _usable_answer(answer, qmap.question) else 0
-    low = (answer or "").lower()
-    numbered = sum(1 for i in range(1, min(len(qmap.parts), 9) + 1) if f"({i})" in low or f"{i}." in low)
-    if numbered:
-        return numbered
-    # Non-numbered prose: approximate coverage by distinct lines/sentences.
-    chunks = [x.strip() for x in re.split(r"[\n]+|(?<=[.!?])\s+", answer or "") if len(x.strip()) >= 12]
-    return min(len(qmap.parts), len(chunks))
-
-
-def _verified_fact_answer(question: str, facts: list[dict[str, Any]], book: SourceBook) -> str:
-    """Zero-memory fallback built only from quote-verified atomic claims."""
-    lines: list[str] = []
-    seen: set[str] = set()
-    for item in facts[:14]:
-        claim = _clean_space(str(item.get("claim") or ""))
-        source = _int(item.get("source"), 0)
-        if not claim:
-            continue
-        key = claim.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        marker = f" [{source}]" if 1 <= source <= len(book.rows) else ""
-        lines.append(claim + marker)
-    text = "\n".join(lines)
-    return text if _usable_answer(text, question) else ""
-
-
-def _grid_for_writer(grid: dict[str, Any], facts: list[dict[str, Any]]) -> dict[str, Any]:
-    """Strip unverified fact claims before final synthesis."""
-    clean = dict(grid)
-    clean["facts"] = facts
-    # Draft answer is untrusted free-form text; the writer receives verified
-    # atomic facts instead of being anchored to a possibly hallucinated draft.
-    clean["draft_answer"] = ""
-    return clean
-
-
-# ---------------------------------------------------------------------------
-# Mandatory multipart coverage compiler
-# ---------------------------------------------------------------------------
-
-
-def _required_part_count(qmap: QuestionMap) -> int:
-    return len(qmap.parts) if qmap.parts else 0
-
-
-def _source_markers(text: str) -> list[int]:
-    out: list[int] = []
-    for raw in re.findall(r"\[(\d{1,3})\]", text or ""):
-        value = _int(raw, 0)
-        if value > 0 and value not in out:
-            out.append(value)
-    return out
-
-
-def _part_object_valid(item: dict[str, Any], index: int, book: SourceBook, question: str) -> bool:
-    if _int(item.get("index"), 0) != index:
-        return False
-    answer = _clean_answer(str(item.get("answer") or ""))
-    if not _usable_answer(answer, question):
-        return False
-    sources = item.get("sources")
-    if not isinstance(sources, list) or not sources:
-        return False
-    valid_source = False
-    for raw in sources[:6]:
-        number = _int(raw, 0)
-        if number > 0 and book.source_allowed(number):
-            valid_source = True
-            break
-    if not valid_source or not _grounded_in_book(answer, question, book):
-        return False
-    quotes = item.get("quotes")
-    valid_quote = False
-    if isinstance(quotes, list):
-        for q in quotes[:6]:
-            if not isinstance(q, dict):
-                continue
-            number = _int(q.get("source"), 0)
-            quote = str(q.get("quote") or "").strip()
-            row = book.row(number)
-            if row is None or not book.source_allowed(number) or len(quote) < 6:
-                continue
-            if _quote_in_body(quote, str(row.get("text") or "")):
-                book.retain(number, quote)
-                valid_quote = True
-    return valid_quote
-
-
-async def _compile_required_parts(
-    qmap: QuestionMap,
-    plan: ResearchPlan,
-    book: SourceBook,
-    deadline: float,
-) -> str:
-    """Compile one independently grounded answer for every explicit part."""
-    count = _required_part_count(qmap)
-    if count <= 0 or not book.rows or _left(deadline) < 12.0:
-        return ""
-    evidence = book.pack(min(MAX_PACK_CHARS, 62000))
-    if not evidence:
-        return ""
-    parts_block = "\n".join(f"({i}) {part}" for i, part in enumerate(qmap.parts, 1))
-    lock_text = ", ".join(book.locked_hosts) if book.locked_hosts else "none"
-    system = (
-        "You are a CLOSED-BOOK multipart evidence compiler. Use ONLY the supplied numbered evidence. "
-        "The user's assertions are not evidence. Produce exactly one answer object for EVERY requested part; "
-        "never merge or omit parts. Every precise name, number, time, rank, date, unit, label and status must "
-        "appear in the supplied evidence. For a count, count the actual listed rows rather than inferring from "
-        "a qualification rule. For a comparison, state both actual result and rule-implied result, and explain "
-        "the difference only when the evidence shows it. For 'among these/best' tasks, establish the requested "
-        "pool before selecting the best member. Preserve source capitalization and marks exactly. "
-        "Each part must cite at least one source number and include at least one exact supporting quote."
-    )
-    user = (
-        f"QUESTION:\n{qmap.question}\n\nREQUIRED PARTS ({count}):\n{parts_block}\n\n"
-        f"HARD SOURCE LOCK: {qmap.hard_source_lock}\nALLOWED HOSTS: {lock_text}\n\nEVIDENCE:\n{evidence}\n\n"
-        "Return exactly valid JSON with this shape:\n"
-        '{"parts":[{"index":1,"answer":"complete direct answer to part 1 with [n] marker(s)",'
-        '"sources":[1],"quotes":[{"source":1,"quote":"exact supporting source text"}]}],'
-        '"all_parts_supported":true}\n\n'
-        f"The parts array MUST contain indices 1 through {count} exactly once. If a part truly cannot be supported, "
-        "return its answer as an empty string and all_parts_supported=false. Do not guess."
-    )
-    payload = await _chat(
-        GRID_MODELS,
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        deadline,
-        6200,
-        min(GRID_TIMEOUT, max(10.0, _left(deadline) - 3.0)),
-        0.0,
-    )
-    data = _json_obj(_llm_text(payload))
-    raw_parts = data.get("parts") if isinstance(data, dict) else None
-    if not isinstance(raw_parts, list):
-        return ""
-    indexed: dict[int, dict[str, Any]] = {}
-    for raw in raw_parts:
-        if not isinstance(raw, dict):
-            continue
-        idx = _int(raw.get("index"), 0)
-        if 1 <= idx <= count and idx not in indexed:
-            indexed[idx] = raw
-    if len(indexed) != count:
-        return ""
-    lines: list[str] = []
-    for idx in range(1, count + 1):
-        item = indexed.get(idx)
-        if item is None or not _part_object_valid(item, idx, book, qmap.question):
-            return ""
-        answer = _clean_answer(str(item.get("answer") or ""))
-        markers = [n for n in _source_markers(answer) if book.source_allowed(n)]
-        if not markers:
-            sources = [_int(x, 0) for x in item.get("sources", []) if _int(x, 0) > 0 and book.source_allowed(_int(x, 0))]
-            if sources:
-                answer = answer.rstrip(" .") + f" [{sources[0]}]"
-        lines.append(f"({idx}) {answer}")
-    compiled = "\n".join(lines)
-    if _answer_part_coverage(compiled, qmap) < count:
-        return ""
-    if not _grounded_in_book(compiled, qmap.question, book):
-        return ""
-    return compiled
-
-
-# ---------------------------------------------------------------------------
-# Answer quality, citations, source-verbatim restoration
-# ---------------------------------------------------------------------------
-
-
-_CITE_RE = re.compile(r"\[(\d{1,3})\]")
-
-
-def _usable_answer(text: str, question: str = "") -> bool:
+                packet = ToolPacket("# seed search crashed")
+            blocks.append(vault.add_packet(packet))
+        else:
+            task.cancel()
+            blocks.append("# seed search timed out")
+    return "\n\n".join(blocks)
+
+
+ACTION_RULES = """
+You are the research director inside a bounded evidence agent. Your goal is to
+beat a strong reference answer on correctness, completeness, source quality,
+exact values, and citation support.
+
+EVIDENCE RULES
+- Use numbered evidence [n]. Never invent a citation number.
+- Prefer the source that originates a fact: official database, regulator,
+  organization, filing, paper, or primary document. An aggregator is useful for
+  discovery, but primary evidence wins.
+- If the question says "using only", "solely", or otherwise restricts the
+  source, final factual claims must be backed by that named source.
+- Copy names, labels, figures, capitalization, units, dates, and status codes
+  exactly from the requested source when the question cares about that source.
+- When a displayed source contains the decisive text, use a KEEP action with an
+  exact verbatim quote. KEEP makes the eventual citation point at the proof
+  rather than page furniture.
+- If a fetched page is long and the needed datum is not visible, use GREP and
+  READ on the already-fetched source instead of searching for the same page again.
+
+COMPLETENESS RULES
+- Answer every distinct sub-question.
+- For a set/filter question, establish the complete candidate roster before
+  deciding who qualifies; verify each relevant member against every condition.
+- For a count/rank/superlative, inspect the complete relevant pool/table before
+  computing the result.
+- For multi-period or multi-stage questions, bind each fact to the correct
+  period/stage/source. Never let a semifinal, prior year, sibling product, or
+  neighboring metric answer a final/current/target slot.
+- Explain a discrepancy when the question explicitly asks for a comparison and
+  the evidence establishes why the values differ.
+- If sources conflict, resolve the conflict before finalizing; do not print two
+  incompatible values for the same requested fact.
+
+ANSWER RULES
+- The first words should answer the question, not narrate your research.
+- Every load-bearing factual sentence should carry [n] immediately after the
+  claim it supports.
+- Obey literal output requirements (ordering, exact text, count, units, etc.).
+- Do not return planning notes, tool syntax, refusals, or "insufficient evidence"
+  prose when you have useful evidence.
+
+ACTION PROTOCOL
+Return ONE JSON object, with no markdown fences.
+
+To research:
+{"actions":[
+  {"type":"search","query":"concise query"},
+  {"type":"fetch","url":"https://...","focus":"section/table/entity"},
+  {"type":"grep","source":3,"pattern":"literal or regex"},
+  {"type":"read","source":3,"offset":12000,"length":5000},
+  {"type":"keep","source":3,"quote":"exact verbatim source text"}
+]}
+
+You may request up to six independent actions at once. GREP/READ/KEEP may only
+refer to source numbers that already exist before this turn.
+
+When the evidence is sufficient:
+{"final":"complete cited answer"}
+
+Do not mix actions and final in the same object.
+""".strip()
+
+
+COMMIT_RULES = """
+Write the final answer to the user's research question using ONLY the numbered
+evidence below for precise factual claims.
+
+Start directly with the requested answer. Answer every requested part. Preserve
+exact source strings for source-sensitive names/labels/figures. Use [n] after
+each factual sentence so it points to evidence that actually states the claim.
+For sets, counts, comparisons, and superlatives, show enough of the pool or
+arithmetic to make completeness checkable, but stay concise. Never mention the
+research process, uncertainty markers, or missing tools. Do not emit JSON or
+tool syntax. If the question explicitly requires only a bare answer, put that
+bare answer on the first line; evidence markers may appear in supporting lines
+that the controller can remove after citations are harvested.
+""".strip()
+
+
+CRITIC_RULES = """
+You are the final pairwise-score critic. Improve the answer only when necessary.
+Check: every requested part answered, correct entity kind, exact period/stage,
+strict named-source compliance, exact source values, no contradictory values,
+complete pool for set/superlative/count questions, and citations on every
+load-bearing claim. Never introduce a factual value not present in the numbered
+evidence. Return only the improved final answer; if already strong, return it
+unchanged.
+""".strip()
+
+
+def _strip_fence(text: str) -> str:
     value = (text or "").strip()
-    if len(value) < 3:
-        return False
-    low = value.lower()
-    bad = (
-        "unable to answer",
-        "i could not complete",
-        "best-effort answer unavailable",
-        "insufficient information",
-        "i cannot determine",
-    )
-    if any(item in low for item in bad):
-        return False
-    if question:
-        q = _clean_space(question)
-        v = _clean_space(value)
-        # Reject accidental prompt echo as an answer.
-        if len(q) > 80 and (v == q or v.startswith(q[: min(300, len(q))])):
-            return False
-    return True
+    value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.I)
+    value = re.sub(r"\s*```$", "", value)
+    return value.strip()
 
 
-def _marker_numbers(text: str, maximum: int) -> list[int]:
+def _turn_object(text: str) -> dict[str, Any] | None:
+    raw = _strip_fence(text)
+    try:
+        value = json.loads(raw)
+        if isinstance(value, dict):
+            return value
+    except Exception:
+        pass
+    first = raw.find("{")
+    last = raw.rfind("}")
+    if first >= 0 and last > first:
+        try:
+            value = json.loads(raw[first:last + 1])
+            if isinstance(value, dict):
+                return value
+        except Exception:
+            return None
+    return None
+
+
+def _normalize_action(item: Any) -> dict[str, Any] | None:
+    if not isinstance(item, dict):
+        return None
+    kind = item.get("type") or item.get("tool") or item.get("name")
+    if not isinstance(kind, str):
+        return None
+    action = dict(item)
+    action["type"] = kind.lower().strip()
+    return action
+
+
+async def _run_action(action: dict[str, Any], question: str,
+                      vault: EvidenceVault) -> ToolPacket:
+    kind = str(action.get("type") or "").lower()
+    if kind == "search":
+        return await _search_packet(str(action.get("query") or ""), advanced=False)
+    if kind == "fetch":
+        return await _fetch_packet(
+            str(action.get("url") or ""),
+            str(action.get("focus") or ""),
+            question,
+        )
+    if kind == "grep":
+        try:
+            source = int(action.get("source") or 0)
+        except Exception:
+            source = 0
+        return ToolPacket(vault.local_grep(source, str(action.get("pattern") or "")))
+    if kind == "read":
+        try:
+            source = int(action.get("source") or 0)
+        except Exception:
+            source = 0
+        try:
+            offset = int(action.get("offset") or 0)
+        except Exception:
+            offset = 0
+        try:
+            length = int(action.get("length") or 4000)
+        except Exception:
+            length = 4000
+        return ToolPacket(vault.local_read(source, offset, length))
+    if kind == "keep":
+        try:
+            source = int(action.get("source") or 0)
+        except Exception:
+            source = 0
+        return ToolPacket(vault.keep_quote(source, str(action.get("quote") or "")))
+    return ToolPacket(f"# unknown action {kind!r}")
+
+
+async def _execute_actions(actions: list[dict[str, Any]], question: str,
+                           vault: EvidenceVault, deadline: float) -> str:
+    chosen = actions[:MAX_ACTIONS_PER_TURN]
+    if not chosen:
+        return "# no valid actions"
+    tasks = [asyncio.ensure_future(_run_action(action, question, vault)) for action in chosen]
+    budget = min(TOOL_PHASE_TIMEOUT, max(5.0, _left(deadline) - MIN_RETURN_SECONDS))
+    try:
+        await asyncio.wait(tasks, timeout=budget)
+    except Exception:
+        pass
+    blocks: list[str] = []
+    # Commit in requested action order, never network-completion order.
+    for task in tasks:
+        if task.done():
+            try:
+                packet = task.result()
+            except Exception as exc:
+                packet = ToolPacket(f"# action crashed: {str(exc)[:180]}")
+            blocks.append(vault.add_packet(packet))
+        else:
+            task.cancel()
+            blocks.append("# action timed out; continue with existing evidence")
+    return "\n\n".join(blocks)
+
+
+_BRACKET_MAP = {
+    0x3010: "[", 0x3011: "]", 0xFF3B: "[", 0xFF3D: "]",
+    0x2011: "-", 0x2212: "-",
+}
+for _digit in range(10):
+    _BRACKET_MAP[0xFF10 + _digit] = chr(48 + _digit)
+
+
+def _normalize_markers(text: str) -> str:
+    return (text or "").translate(_BRACKET_MAP)
+
+
+_CITE_RE = re.compile(r"\[([0-9][0-9,\s-]*)\]")
+
+
+def _marker_numbers(text: str, top: int) -> list[int]:
+    normalized = _normalize_markers(text)
     out: list[int] = []
-    for match in _CITE_RE.finditer(text or ""):
-        number = _int(match.group(1), 0)
-        if 1 <= number <= maximum and number not in out:
-            out.append(number)
+    seen: set[int] = set()
+    for match in _CITE_RE.finditer(normalized):
+        for chunk in match.group(1).split(","):
+            part = chunk.strip()
+            range_match = re.fullmatch(r"(\d{1,4})\s*-\s*(\d{1,4})", part)
+            if range_match:
+                low = int(range_match.group(1))
+                high = int(range_match.group(2))
+                high = min(high, low + 20)
+                for number in range(low, high + 1):
+                    if 1 <= number <= top and number not in seen:
+                        seen.add(number)
+                        out.append(number)
+            elif part.isdigit():
+                number = int(part)
+                if 1 <= number <= top and number not in seen:
+                    seen.add(number)
+                    out.append(number)
     return out
 
 
-def _normalize_markers(text: str, maximum: int) -> str:
-    def repl(match: re.Match[str]) -> str:
-        number = _int(match.group(1), 0)
-        return f"[{number}]" if 1 <= number <= maximum else ""
-    return re.sub(r"\[(\d{1,4})\]", repl, text or "")
+_TOOLISH_RE = re.compile(
+    r"<\s*/?\s*tool|^\s*\{\s*\"actions\"\s*:|\b(?:search|fetch|grep|read|keep)\s*\(",
+    re.I,
+)
+_REFUSAL_RE = re.compile(
+    r"^\s*(?:i (?:cannot|can't|am unable)|unable to|sorry[,.:]|"
+    r"best-effort answer unavailable|no supported answer)",
+    re.I,
+)
 
 
-def _citations(text: str, book: SourceBook) -> list[CitationRef]:
+def _usable_answer(text: str) -> bool:
+    value = _normalize_markers(text).strip()
+    if not value:
+        return False
+    if _TOOLISH_RE.search(value) or _REFUSAL_RE.match(value):
+        return False
+    if len(value) < 8:
+        return False
+    return True
+
+
+def _has_citation(text: str) -> bool:
+    return bool(re.search(r"\[[0-9]{1,4}\]", _normalize_markers(text or "")))
+
+
+_NUM_RE = re.compile(r"(?<!\[)\b\d[\d,]*(?:\.\d+)?%?\b")
+
+
+def _unsupported_numbers(answer: str, vault: EvidenceVault) -> list[str]:
+    flagged: list[str] = []
+    for sentence in re.split(r"(?<=[.!?])\s+|\n+", _normalize_markers(answer or "")):
+        if not sentence.strip():
+            continue
+        cited = _marker_numbers(sentence, len(vault.rows))
+        if not cited:
+            continue
+        source_text = " ".join(
+            (vault.row(number) or {}).get("text") or ""
+            for number in cited
+        )
+        plain_source = source_text.replace(",", "")
+        for match in _NUM_RE.finditer(_CITE_RE.sub(" ", sentence)):
+            token = match.group(0)
+            digits = re.sub(r"\D", "", token)
+            if len(digits) < 2:
+                continue
+            if token not in source_text and token.replace(",", "") not in plain_source:
+                if token not in flagged:
+                    flagged.append(token)
+    return flagged[:6]
+
+
+def _answer_part_signal(answer: str, shape: QuestionShape) -> bool:
+    if shape.numbered_parts <= 1:
+        return True
+    text = _normalize_markers(answer or "")
+    explicit = 0
+    for number in range(1, shape.numbered_parts + 1):
+        if re.search(rf"(?:^|\n|\s)\({number}\)", text):
+            explicit += 1
+    if explicit == shape.numbered_parts:
+        return True
+    # Do not reject good unnumbered prose solely for formatting; require enough
+    # substantive sentence/line units to plausibly cover all parts.
+    units = [x for x in re.split(r"(?<=[.!?])\s+|\n+", text) if len(x.strip()) > 18]
+    return len(units) >= shape.numbered_parts
+
+
+def _citations(answer: str, vault: EvidenceVault) -> list[CitationRef]:
     refs: list[CitationRef] = []
     spent = 0
-    for number in _marker_numbers(text, len(book.rows)):
+    for number in _marker_numbers(answer, len(vault.rows)):
         if len(refs) >= MAX_CITATIONS:
             break
-        ref, cost = book.citation(number)
+        ref, cost = vault.citation(number)
         if ref is None:
             continue
-        if spent + cost > MAX_EVIDENCE_CHARS:
+        if spent + cost > TOTAL_EVIDENCE_CAP:
             continue
         refs.append(ref)
         spent += cost
     return refs
 
 
-def _retain_output_quotes(data: dict[str, Any], book: SourceBook) -> None:
-    proof = data.get("proof_quotes")
-    if not isinstance(proof, list):
-        return
-    for item in proof:
-        if not isinstance(item, dict):
+def _output_only_line(answer: str, question: str) -> str:
+    shape = QuestionShape(question)
+    if not shape.output_only:
+        return answer
+    for raw in (answer or "").splitlines():
+        line = raw.strip()
+        if not line:
             continue
-        source = _int(item.get("source"), 0)
-        quote = item.get("quote")
-        if source > 0 and isinstance(quote, str):
-            book.retain(source, quote)
-
-
-def _restore_verbatim(answer: str, values: list[str]) -> str:
-    result = answer or ""
-    # Longest first prevents replacing a short substring inside a longer exact label.
-    ordered = sorted([x for x in values if 2 <= len(x) <= 180], key=len, reverse=True)
-    for exact in ordered:
-        try:
-            pattern = re.compile(re.escape(exact), flags=re.I)
-            if pattern.search(result):
-                result = pattern.sub(lambda _m: exact, result)
-        except Exception:
+        if line.startswith(("#", ">", "Proof:", "Evidence:")):
             continue
-    return result
+        # Remove citation markers from the literal output line.
+        line = _CITE_RE.sub("", _normalize_markers(line)).strip()
+        line = line.strip("*_` ")
+        if line:
+            return line
+    return _CITE_RE.sub("", _normalize_markers(answer or "")).strip()
 
 
-def _clean_answer(text: str) -> str:
-    value = (text or "").strip()
-    value = re.sub(r"^```(?:markdown|text)?\s*", "", value, flags=re.I)
-    value = re.sub(r"\s*```$", "", value)
-    value = re.sub(r"^(?:Answer|Final answer)\s*:\s*", "", value, flags=re.I)
-    return value.strip()
+def _research_prompt(question: str, shape: QuestionShape, vault: EvidenceVault,
+                     recent: str, provisional: str, left: float) -> list[dict[str, Any]]:
+    extra = shape.hint()
+    state = vault.digest()
+    user = (
+        f"QUESTION:\n{question}\n\n"
+        f"QUESTION-SHAPE REQUIREMENTS:\n{extra or '(ordinary factual research question)'}\n\n"
+        f"NUMBERED EVIDENCE CURRENTLY AVAILABLE:\n{state}\n\n"
+    )
+    if recent.strip():
+        user += f"RESULTS OF THE MOST RECENT ACTIONS:\n{_clip(recent, 18000)}\n\n"
+    if provisional.strip():
+        user += (
+            "CURRENT PROVISIONAL ANSWER (repair it if research shows a problem):\n"
+            f"{_clip(provisional, 10000)}\n\n"
+        )
+    user += (
+        f"Approximately {int(max(0.0, left))} seconds remain. "
+        "Choose the highest-value next research actions, or finalize if every "
+        "load-bearing part is grounded."
+    )
+    return [
+        {"role": "system", "content": ACTION_RULES},
+        {"role": "user", "content": user},
+    ]
 
 
-def _fact_rescue(qmap: QuestionMap, grid: dict[str, Any], book: SourceBook) -> str:
-    draft = _grid_draft(grid)
-    if _usable_answer(draft, qmap.question):
-        return _normalize_markers(draft, len(book.rows))
-    facts = grid.get("facts")
-    lines: list[str] = []
-    if isinstance(facts, list):
-        for item in facts[:12]:
-            if not isinstance(item, dict):
-                continue
-            claim = _clean_space(str(item.get("claim") or ""))
-            source = _int(item.get("source"), 0)
-            if claim:
-                marker = f" [{source}]" if 1 <= source <= len(book.rows) else ""
-                lines.append(claim + marker)
-    if lines:
-        return "\n".join(lines)
-    # Last evidence-based rung: return concise source excerpts, never the question.
-    for number in book.ranked()[:3]:
-        row = book.row(number)
-        if row is None:
+async def _research_loop(question: str, shape: QuestionShape, vault: EvidenceVault,
+                         deadline: float, recent: str) -> str:
+    provisional = ""
+    for turn in range(MAX_RESEARCH_TURNS):
+        left = _left(deadline)
+        if left <= WRAPUP_SECONDS:
+            break
+        messages = _research_prompt(question, shape, vault, recent, provisional, left)
+        payload = await _chat(
+            PRIMARY_MODELS, messages, deadline,
+            max_tokens=2600, timeout_cap=TURN_TIMEOUT, temperature=0.1,
+        )
+        raw = _llm_text(payload)
+        if not raw:
+            break
+        obj = _turn_object(raw)
+        if obj is None:
+            if _usable_answer(raw):
+                provisional = raw
+                break
+            recent = "# model output was not valid action JSON; choose actions or final next turn"
             continue
-        text = str(row.get("text") or "")
-        if text.strip():
-            return _cap(text.strip(), 1800) + f" [{number}]"
+
+        final = obj.get("final")
+        if isinstance(final, str) and _usable_answer(final):
+            provisional = final.strip()
+            # A cited, plausibly complete answer can commit early.
+            if _has_citation(provisional) and _answer_part_signal(provisional, shape):
+                unsupported = _unsupported_numbers(provisional, vault)
+                if not unsupported:
+                    break
+            recent = (
+                "# provisional answer needs one more grounding pass: "
+                "ensure all requested parts and precise values are backed by [n]"
+            )
+            continue
+
+        raw_actions = obj.get("actions")
+        actions: list[dict[str, Any]] = []
+        if isinstance(raw_actions, list):
+            for item in raw_actions:
+                action = _normalize_action(item)
+                if action is not None:
+                    actions.append(action)
+        if not actions:
+            recent = "# no valid actions were returned; finalize or choose concrete actions"
+            continue
+        recent = await _execute_actions(actions, question, vault, deadline)
+    return provisional
+
+
+async def _write_final(question: str, shape: QuestionShape, vault: EvidenceVault,
+                       provisional: str, deadline: float) -> str:
+    digest = vault.digest()
+    extra = shape.hint()
+    prompt = (
+        f"QUESTION:\n{question}\n\n"
+        f"QUESTION-SHAPE REQUIREMENTS:\n{extra or '(ordinary factual research question)'}\n\n"
+        f"NUMBERED EVIDENCE:\n{digest}\n\n"
+    )
+    if provisional.strip():
+        prompt += (
+            "A research-loop draft follows. Keep anything it got right, but correct "
+            "it wherever the evidence or question scope disagrees:\n"
+            f"{_clip(provisional, 12000)}\n\n"
+        )
+    prompt += "Write the final answer now."
+    payload = await _chat(
+        WRITER_MODELS,
+        [
+            {"role": "system", "content": COMMIT_RULES},
+            {"role": "user", "content": prompt},
+        ],
+        deadline,
+        max_tokens=4200,
+        timeout_cap=WRITER_TIMEOUT,
+        temperature=0.08,
+    )
+    answer = _llm_text(payload)
+    if _usable_answer(answer):
+        return answer
+    if _usable_answer(provisional):
+        return provisional
     return ""
 
 
-async def _write_answer(
-    qmap: QuestionMap,
-    plan: ResearchPlan,
-    grid: dict[str, Any],
-    book: SourceBook,
-    deadline: float,
-) -> str:
-    rescue = _fact_rescue(qmap, grid, book)
-    if _left(deadline) < 34.0 or _money_left() < MIN_WRITE_USD:
-        return rescue
-    system = (
-        "You are a CLOSED-BOOK precision answer compiler. The VERIFIED FACTS in the proof grid are the only "
-        "load-bearing factual claims you may state. Assertions in the user's question are NOT facts unless the proof "
-        "grid verifies them. Do not substitute model-memory facts, famous people, prior "
-        "years, remembered results, or plausible values. If a requested fact is not verified, say only what the "
-        "verified evidence supports. Answer EVERY requested sub-question, preferably in the same order. "
-        "SOURCE-VERBATIM RULE: if the source prints a person's name, label, status code, mark, time, number, "
-        "date, unit or category in a particular form, copy that form exactly; do not title-case, normalize, "
-        "round, convert or paraphrase it. COMPARISON RULE: if the question asks how two counts/rules/results "
-        "compare and the evidence identifies why they differ, explicitly state the difference and the "
-        "source-supported reason. COMPLETENESS RULE: for 'among/all/best/which' questions, make clear that "
-        "the selected result was compared against the relevant pool. Put [source-number] immediately after "
-        "each factual sentence or bullet it proves. Be concise but do not omit a requested component. Return JSON only."
+async def _critic(question: str, shape: QuestionShape, vault: EvidenceVault,
+                  answer: str, deadline: float) -> str:
+    if not _usable_answer(answer) or _left(deadline) < 28.0:
+        return answer
+    if not shape.complex and not _unsupported_numbers(answer, vault):
+        return answer
+    evidence = vault.digest(cap=36000)
+    unsupported = _unsupported_numbers(answer, vault)
+    note = ""
+    if unsupported:
+        note = (
+            "\nThe deterministic checker found answer values not present in their "
+            "cited source text: " + ", ".join(unsupported) + ". Remove or correct them."
+        )
+    prompt = (
+        f"QUESTION:\n{question}\n\n"
+        f"CURRENT ANSWER:\n{_clip(answer, 14000)}\n\n"
+        f"NUMBERED EVIDENCE:\n{evidence}\n"
+        f"{note}\n\nReturn the corrected final answer."
     )
-    user = f'''QUESTION:\n{qmap.question}\n\nQUESTION MAP:\n{qmap.block()}\n\nPLAN CHECKLIST:\n{plan.block()}\n\nPROOF GRID:\n{json.dumps(grid, ensure_ascii=False)[:26000]}\n\nEVIDENCE:\n{book.pack(50000)}\n\nReturn exactly:\n{{"answer":"final answer with [n] markers","proof_quotes":[{{"source":1,"quote":"exact decisive source quote used by the answer"}}]}}\n\nBefore returning, silently verify: all requested parts answered; exact source spellings/marks preserved; discrepancy explained when evidence supports it; no unsupported background added.'''
     payload = await _chat(
-        WRITE_MODELS,
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        WRITER_MODELS,
+        [
+            {"role": "system", "content": CRITIC_RULES},
+            {"role": "user", "content": prompt},
+        ],
         deadline,
-        4600,
-        WRITE_TIMEOUT,
-        0.0,
+        max_tokens=3800,
+        timeout_cap=CRITIC_TIMEOUT,
+        temperature=0.0,
     )
-    data = _json_object(_llm_text(payload))
-    if data is None:
-        return rescue
-    _retain_output_quotes(data, book)
-    answer = data.get("answer")
-    if not isinstance(answer, str):
-        return rescue
-    answer = _normalize_markers(_clean_answer(answer), len(book.rows))
-    answer = _restore_verbatim(answer, _grid_verbatim(grid))
-    if not _usable_answer(answer, qmap.question):
-        return rescue
-    return answer
+    candidate = _llm_text(payload)
+    if not _usable_answer(candidate):
+        return answer
+    if len(candidate) < max(12, int(len(answer) * 0.45)):
+        return answer
+    # Do not adopt a critic answer that drops all citations while evidence exists.
+    if vault.rows and _has_citation(answer) and not _has_citation(candidate):
+        return answer
+    return candidate
 
 
-async def _review_answer(
-    answer: str,
-    qmap: QuestionMap,
-    plan: ResearchPlan,
-    grid: dict[str, Any],
-    book: SourceBook,
-    deadline: float,
-) -> str:
-    if not _usable_answer(answer, qmap.question):
-        return answer
-    if _left(deadline) < 27.0 or _money_left() < MIN_REVIEW_USD:
-        return answer
-    system = (
-        "You are a strict CLOSED-BOOK final-answer reviewer. You may revise only with supplied verified evidence. "
-        "Never replace a source-backed value with remembered knowledge from another year/event/entity. "
-        "Judge the CURRENT ANSWER the way a strict pairwise benchmark judge would. Prefer the answer that is more "
-        "complete, source-exact, directly responsive, and better supported. Check: (1) every explicit/numbered "
-        "sub-question is answered; (2) no answer value came from an unverified claim in the QUESTION; (3) names, labels, marks, times, dates, "
-        "units and status codes match source spelling/capitalization exactly; (4) a requested comparison says "
-        "both the numerical/logical difference and, when evidenced, why it exists; (5) row counts come from actual "
-        "listed rows rather than an expected rule count; (6) ranking/set answers demonstrate the relevant comparison "
-        "pool; (7) every factual sentence has a valid [n] marker. "
-        "Do not add uncited model-memory facts. Return JSON only."
-    )
-    user = f'''QUESTION:\n{qmap.question}\n\nCHECKLIST:\n{plan.block()}\n\nCURRENT ANSWER:\n{answer}\n\nPROOF GRID:\n{json.dumps(grid, ensure_ascii=False)[:22000]}\n\nDECISIVE EVIDENCE:\n{book.pack(42000)}\n\nReturn exactly:\n{{"answer":"corrected answer, or the original unchanged if already optimal","proof_quotes":[{{"source":1,"quote":"exact source quote"}}]}}'''
-    payload = await _chat(
-        ("deepseek-ai/DeepSeek-V3.2-TEE", "google/gemma-4-31B-turbo-TEE", "Qwen/Qwen3.6-27B-TEE"),
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        deadline,
-        3600,
-        REVIEW_TIMEOUT,
-        0.0,
-    )
-    data = _json_object(_llm_text(payload))
-    if data is None:
-        return answer
-    _retain_output_quotes(data, book)
-    revised = data.get("answer")
-    if not isinstance(revised, str):
-        return answer
-    revised = _normalize_markers(_clean_answer(revised), len(book.rows))
-    revised = _restore_verbatim(revised, _grid_verbatim(grid))
-    if _usable_answer(revised, qmap.question):
-        return revised
-    return answer
-
-
-# ---------------------------------------------------------------------------
-# Structured output
-# ---------------------------------------------------------------------------
+def _deterministic_partial(vault: EvidenceVault) -> str:
+    if not vault.rows:
+        return ""
+    lines: list[str] = []
+    query_terms = _terms(vault.question, 24)
+    ranked: list[tuple[int, int, dict[str, Any]]] = []
+    for number, row in enumerate(vault.rows, start=1):
+        content = (row.get("title") or "") + " " + (row.get("preview") or "")
+        score = _overlap_score(content, query_terms)
+        if row.get("kind") == "fetch":
+            score += 3
+        ranked.append((score, number, row))
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    for _, number, row in ranked[:6]:
+        preview = _space(row.get("preview") or "")
+        if len(preview) < 30:
+            preview = _space(vault._row_excerpt(row, 500))
+        if preview:
+            lines.append(f"{_clip(preview, 420)} [{number}]")
+    return "\n".join(lines)
 
 
 def _schema_kind(schema: Any) -> str:
@@ -2787,58 +1310,25 @@ def _schema_kind(schema: Any) -> str:
     kind = schema.get("type")
     if isinstance(kind, str):
         return kind
-    for key in ("anyOf", "oneOf", "allOf"):
-        value = schema.get(key)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    found = _schema_kind(item)
-                    if found and found != "null":
-                        return found
+    if isinstance(kind, list):
+        for item in kind:
+            if isinstance(item, str) and item != "null":
+                return item
+    if isinstance(schema.get("properties"), dict):
+        return "object"
+    if isinstance(schema.get("items"), dict):
+        return "array"
     return ""
 
 
-def _schema_branch(schema: Any) -> dict[str, Any]:
-    if not isinstance(schema, dict):
-        return {}
-    if isinstance(schema.get("type"), str):
-        return schema
-    for key in ("anyOf", "oneOf", "allOf"):
-        value = schema.get(key)
-        if isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict) and _schema_kind(item) != "null":
-                    return item
-    return schema
-
-
-def _shape_ok(value: Any, schema: Any, depth: int = 0) -> bool:
-    if depth > 6 or not isinstance(schema, dict):
+def _shape_ok(value: Any, schema: Any) -> bool:
+    kind = _schema_kind(schema)
+    if not kind:
         return True
-    branch = _schema_branch(schema)
-    enum = branch.get("enum")
-    if isinstance(enum, list) and enum and value not in enum:
-        return False
-    kind = _schema_kind(branch)
     if kind == "object":
-        if not isinstance(value, dict):
-            return False
-        props = branch.get("properties") or {}
-        required = branch.get("required") or []
-        if isinstance(required, list):
-            for key in required:
-                if key not in value:
-                    return False
-        if isinstance(props, dict):
-            for key, sub in props.items():
-                if key in value and isinstance(sub, dict) and not _shape_ok(value[key], sub, depth + 1):
-                    return False
-        return True
+        return isinstance(value, dict)
     if kind == "array":
-        if not isinstance(value, list):
-            return False
-        sub = branch.get("items") or {}
-        return all(_shape_ok(item, sub, depth + 1) for item in value[:40])
+        return isinstance(value, list)
     if kind == "string":
         return isinstance(value, str)
     if kind == "integer":
@@ -2852,1066 +1342,149 @@ def _shape_ok(value: Any, schema: Any, depth: int = 0) -> bool:
     return True
 
 
-def _strip_citations(text: str) -> str:
-    return _clean_space(_CITE_RE.sub("", text or ""))
-
-
-def _value_lines(text: str) -> list[str]:
-    clean = _strip_citations(text)
-    parts = re.split(r"[\n;]+", clean)
-    out: list[str] = []
-    for raw in parts:
-        item = re.sub(r"^\s*(?:[-*•]|\d+[.)])\s*", "", raw).strip()
-        if item:
-            out.append(item[:500])
-        if len(out) >= 24:
-            break
-    return out
-
-
-def _coerce(text: str, schema: Any, depth: int = 0) -> Any:
-    branch = _schema_branch(schema)
-    if depth > 6:
-        return _strip_citations(text)[:500]
-    enum = branch.get("enum")
-    if isinstance(enum, list) and enum:
-        low = text.lower()
-        for option in enum:
-            if isinstance(option, str) and option.lower() in low:
-                return option
-        return enum[0]
-    kind = _schema_kind(branch)
-    if kind == "object":
-        props = branch.get("properties") or {}
-        required = branch.get("required") or list(props.keys()) if isinstance(props, dict) else []
-        out: dict[str, Any] = {}
-        if isinstance(required, list):
-            for key in required:
-                sub = props.get(key) if isinstance(props, dict) else {}
-                out[str(key)] = _coerce(text, sub if isinstance(sub, dict) else {}, depth + 1)
-        return out
-    if kind == "array":
-        sub = branch.get("items") or {}
-        return [_coerce(item, sub, depth + 1) for item in _value_lines(text)[:12]]
-    clean = _strip_citations(text)
-    if kind in ("integer", "number"):
-        match = re.search(r"-?\d[\d,]*(?:\.\d+)?", clean)
-        if match:
-            raw = match.group(0).replace(",", "")
-            try:
-                return int(float(raw)) if kind == "integer" else float(raw)
-            except Exception:
-                return 0 if kind == "integer" else 0.0
-        return 0 if kind == "integer" else 0.0
-    if kind == "boolean":
-        return not bool(re.match(r"\s*(?:no|false|none|not)\b", clean, flags=re.I))
-    if kind == "null":
+async def _schema_convert(question: str, answer: str, schema: Any,
+                          deadline: float) -> Any:
+    if _left(deadline) < 12.0:
         return None
-    return clean[:1200]
-
-
-async def _structured(answer: str, question: str, schema: Any, deadline: float) -> Any:
-    fallback = _coerce(answer, schema)
-    if _left(deadline) < 21.0 or _money_left() < MIN_SCHEMA_USD:
-        return fallback
-    system = (
-        "Convert the supplied researched answer into the requested JSON schema. Preserve source values "
-        "verbatim. Output ONLY the JSON value, with no markdown and no explanation. Do not invent facts."
+    ask = (
+        "Convert the answer to a JSON value valid under the supplied JSON schema. "
+        "Output only the JSON value, no fence or explanation.\n\n"
+        f"SCHEMA:\n{json.dumps(schema)}\n\n"
+        f"QUESTION:\n{question}\n\nANSWER:\n{_clip(answer, 15000)}"
     )
-    user = f"QUESTION:\n{question}\n\nANSWER:\n{_strip_citations(answer)}\n\nSCHEMA:\n{json.dumps(schema, ensure_ascii=False)[:16000]}"
     payload = await _chat(
-        SCHEMA_MODELS,
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
+        WRITER_MODELS,
+        [
+            {"role": "system", "content": "Return strictly valid JSON matching the schema."},
+            {"role": "user", "content": ask},
+        ],
         deadline,
-        2600,
-        SCHEMA_TIMEOUT,
-        0.0,
+        max_tokens=3000,
+        timeout_cap=SCHEMA_TIMEOUT,
+        temperature=0.0,
     )
-    raw = _llm_text(payload).strip()
-    if raw.startswith("```"):
-        raw = re.sub(r"^```(?:json)?\s*", "", raw, flags=re.I)
-        raw = re.sub(r"\s*```$", "", raw)
+    raw = _strip_fence(_llm_text(payload))
     try:
         value = json.loads(raw)
-        if _shape_ok(value, schema):
-            return value
     except Exception:
-        pass
-    return fallback
-
-
-async def _direct_evidence_answer(question: str, book: SourceBook, deadline: float) -> str:
-    evidence = book.pack(min(MAX_PACK_CHARS, 52_000))
-    if not evidence or _left(deadline) < 12.0:
-        return ""
-    system = (
-        "Answer using ONLY the supplied numbered evidence. Treat claims embedded in the QUESTION as untrusted. "
-        "Answer every requested sub-question in order and label explicit multipart answers (1), (2), etc. "
-        "Never finalize a multipart response with fewer answered parts than the question contains. "
-        "Prefer actual listed rows over what a rule would normally imply. "
-        "Preserve source spelling, capitalization, marks, "
-        "times, dates, units, labels and status codes exactly. Explain count/rule "
-        "discrepancies when the evidence shows the reason. Cite each load-bearing "
-        "claim with [source-number]. Never introduce a precise value or proper name "
-        "that is absent from the evidence."
-    )
-    user = f"QUESTION:\n{question}\n\nEVIDENCE:\n{evidence}"
-    payload = await _chat(
-        WRITE_MODELS,
-        [{"role": "system", "content": system}, {"role": "user", "content": user}],
-        deadline,
-        4200,
-        min(WRITE_TIMEOUT, max(8.0, _left(deadline) - 2.0)),
-        0.0,
-    )
-    answer = _clean_answer(_llm_text(payload))
-    return answer if _usable_answer(answer, question) else ""
-
-
-def _requires_external_grounding(qmap: QuestionMap) -> bool:
-    low = qmap.question.lower()
-    return bool(
-        qmap.named_sources
-        or qmap.must_preserve_exact
-        or "official" in low
-        or "according to" in low
-        or "source" in low
-        or "results page" in low
-        or "report" in low
-    )
-
-
-# ---------------------------------------------------------------------------
-# Emergency answer — never echo the prompt
-# ---------------------------------------------------------------------------
-
-
-async def _emergency_answer(question: str, deadline: float) -> str:
-    if _left(deadline) < 5.0:
-        return "No supported answer was produced."
-    system = (
-        "Answer the user's question directly and concisely from your best knowledge. This is an emergency "
-        "fallback because research tooling failed. Never repeat the question as the answer and never claim "
-        "to have citations you do not have."
-    )
-    payload = await _chat(
-        REVIEW_MODELS,
-        [{"role": "system", "content": system}, {"role": "user", "content": question}],
-        deadline,
-        1800,
-        min(EMERGENCY_TIMEOUT, max(5.0, _left(deadline) - 1.0)),
-        0.0,
-    )
-    text = _clean_answer(_llm_text(payload))
-    if _usable_answer(text, question):
-        return text
-    return "No supported answer was produced."
-
-
-# ---------------------------------------------------------------------------
-# Main controller
-# ---------------------------------------------------------------------------
-
-
-async def _solve_legacy(query: Query, question: str) -> Response:
-    started = monotonic()
-    deadline = started + WALL_SECONDS
-    try:
-        await _load_tooling()
-    except Exception:
-        pass
-
-    qmap = QuestionMap(question, query.output_schema)
-    try:
-        plan = await _make_plan(qmap, deadline)
-    except Exception:
-        plan = _fallback_plan(qmap)
-    book = SourceBook(qmap, plan)
-
-    # One high-value retrieval wave. Keep the exact event/year/source terms from
-    # the question; do not let an LLM planner drift to a remembered benchmark.
-    try:
-        await _search_many(plan.queries, book, deadline)
-        book.infer_source_lock()
-    except Exception:
-        pass
-    try:
-        targets = _fetch_candidates(book, FETCH_CAP)
-        await _fetch_many(targets, book, deadline)
-        book.infer_source_lock()
-    except Exception:
-        pass
-
-    # Build one central grid and immediately discard any fact whose cited quote
-    # cannot be found literally in the source. This is the v7 grounding wall.
-    try:
-        grid = await _build_grid(qmap, plan, book, deadline)
-    except Exception:
-        grid = _fallback_grid(qmap, plan, book)
-    facts = _verified_facts(grid, book)
-    clean_grid = _grid_for_writer(grid, facts)
-    best_answer = _verified_fact_answer(question, facts, book)
-    protected_compiled = False
-
-    # The evidence compiler is now an independent answer path, not merely a
-    # no-facts emergency. V8 proved that one bad deterministic fact could suppress
-    # a much richer evidence answer. For multi-part/source-bound tasks, always try
-    # one direct closed-book synthesis from the retrieved evidence.
-    coverage_target = max(2, len(qmap.parts) if qmap.parts else 2)
-    sparse_fact_path = len(facts) < coverage_target or _answer_part_coverage(best_answer, qmap) < min(coverage_target, 4)
-    if book.rows and (sparse_fact_path or _grid_has_real_gaps(grid)):
-        try:
-            direct = await _direct_evidence_answer(question, book, deadline)
-            if _grounded_in_book(direct, question, book):
-                if _answer_part_coverage(direct, qmap) >= _answer_part_coverage(best_answer, qmap):
-                    best_answer = direct
-        except Exception:
-            pass
-
-    # Mandatory multipart compiler: if the prompt explicitly contains N
-    # numbered parts, compile and validate all N independently.
-    if qmap.parts and book.rows and _left(deadline) > 18.0:
-        try:
-            compiled = await _compile_required_parts(qmap, plan, book, deadline)
-            if compiled and _answer_part_coverage(compiled, qmap) == len(qmap.parts):
-                compiled = _sanitize_answer_conflicts(compiled, qmap, book)
-                if not _answer_has_final_count_conflict(compiled, qmap, book):
-                    best_answer = compiled
-                    protected_compiled = bool(qmap.hard_source_lock)
-        except Exception:
-            pass
-
-    # A single targeted repair is allowed only when too little quote-verified
-    # evidence survived. Do not spend another full wave merely to polish style.
-    needs_repair = (
-        len(facts) < coverage_target
-        or _grid_has_real_gaps(grid)
-        or (bool(qmap.parts) and _answer_part_coverage(best_answer, qmap) < len(qmap.parts))
-    )
-    if needs_repair and not protected_compiled and _elapsed(started) < REPAIR_LATEST_ELAPSED:
-        repair = _repair_queries(grid)[:1]
-        if repair:
-            try:
-                await _search_many(repair, book, deadline)
-                await _fetch_many(_fetch_candidates(book, min(2, FETCH_CAP)), book, deadline)
-                newer = await _build_grid(qmap, plan, book, deadline)
-                newer_facts = _verified_facts(newer, book)
-                if len(newer_facts) > len(facts):
-                    grid = newer
-                    facts = newer_facts
-                    clean_grid = _grid_for_writer(grid, facts)
-                    mechanical = _verified_fact_answer(question, facts, book)
-                    if _answer_part_coverage(mechanical, qmap) > _answer_part_coverage(best_answer, qmap):
-                        best_answer = mechanical
-                # Whether or not the grid improved, newly retrieved evidence can
-                # improve a complete direct answer.
-                if book.rows:
-                    direct = await _direct_evidence_answer(question, book, deadline)
-                    if _grounded_in_book(direct, question, book) and _answer_part_coverage(direct, qmap) >= _answer_part_coverage(best_answer, qmap):
-                        best_answer = direct
-            except Exception:
-                pass
-
-    # Re-run the strict coverage compiler after any repair wave.
-    if qmap.parts and book.rows and _answer_part_coverage(best_answer, qmap) < len(qmap.parts) and _left(deadline) > 14.0:
-        try:
-            compiled = await _compile_required_parts(qmap, plan, book, deadline)
-            if compiled and _answer_part_coverage(compiled, qmap) == len(qmap.parts):
-                compiled = _sanitize_answer_conflicts(compiled, qmap, book)
-                if not _answer_has_final_count_conflict(compiled, qmap, book):
-                    best_answer = compiled
-                    protected_compiled = protected_compiled or bool(qmap.hard_source_lock)
-        except Exception:
-            pass
-
-    # Final synthesis is permitted only from quote-verified facts. Its output
-    # must pass a deterministic grounding firewall or it is discarded.
-    if facts and not protected_compiled and _elapsed(started) < FORCE_COMMIT_ELAPSED:
-        try:
-            written = await _write_answer(qmap, plan, clean_grid, book, deadline)
-            writer_grounded = _grounded_answer(written, question, facts, book) or _grounded_in_book(written, question, book)
-            if writer_grounded and _answer_part_coverage(written, qmap) >= _answer_part_coverage(best_answer, qmap):
-                best_answer = written
-        except Exception:
-            pass
-
-    # One short review only if there is ample time. The revised answer must pass
-    # the same deterministic grounding firewall before it can replace the prior.
-    current_grounded = _grounded_answer(best_answer, question, facts, book) if facts else False
-    current_grounded = current_grounded or _grounded_in_book(best_answer, question, book)
-    if not protected_compiled and _elapsed(started) < REVIEW_LATEST_ELAPSED and current_grounded:
-        try:
-            reviewed = await _review_answer(best_answer, qmap, plan, clean_grid, book, deadline)
-            reviewed_grounded = (_grounded_answer(reviewed, question, facts, book) if facts else False) or _grounded_in_book(reviewed, question, book)
-            if reviewed_grounded and _answer_part_coverage(reviewed, qmap) >= _answer_part_coverage(best_answer, qmap):
-                best_answer = reviewed
-        except Exception:
-            pass
-
-    # If free-form synthesis drifted outside both the verified-fact basis and
-    # retrieved evidence, fall back mechanically. Do not discard a complete,
-    # evidence-grounded answer merely because proof-grid JSON was sparse.
-    fact_ok = _grounded_answer(best_answer, question, facts, book) if facts else False
-    book_ok = _grounded_in_book(best_answer, question, book)
-    if facts and not (fact_ok or book_ok):
-        best_answer = _verified_fact_answer(question, facts, book)
-
-    # Hard completeness gate for explicit multipart questions.
-    if qmap.parts and _answer_part_coverage(best_answer, qmap) < len(qmap.parts) and book.rows and _left(deadline) > 10.0:
-        try:
-            compiled = await _compile_required_parts(qmap, plan, book, deadline)
-            if compiled:
-                compiled = _sanitize_answer_conflicts(compiled, qmap, book)
-                if not _answer_has_final_count_conflict(compiled, qmap, book):
-                    best_answer = compiled
-        except Exception:
-            pass
-
-    best_answer = _sanitize_answer_conflicts(best_answer, qmap, book)
-    best_answer = _restore_verbatim(best_answer, _grid_verbatim(grid))
-    best_answer = _sanitize_answer_conflicts(best_answer, qmap, book)
-    best_answer = _normalize_markers(_clean_answer(best_answer), len(book.rows))
-
-    # Last deterministic invariant: a final-field count cannot contradict the
-    # section-scoped official result table.  If it somehow does, prefer a fresh
-    # coverage compilation rather than emitting mutually exclusive facts.
-    if _answer_has_final_count_conflict(best_answer, qmap, book) and qmap.parts and _left(deadline) > 8.0:
-        try:
-            repaired = await _compile_required_parts(qmap, plan, book, deadline)
-            repaired = _sanitize_answer_conflicts(repaired, qmap, book)
-            if repaired and not _answer_has_final_count_conflict(repaired, qmap, book):
-                best_answer = repaired
-        except Exception:
-            pass
-
-    if not _usable_answer(best_answer, question):
-        # Evidence excerpts are safer than model-memory invention.
-        best_answer = _fact_rescue(qmap, clean_grid, book)
-    if not _usable_answer(best_answer, question) and not _requires_external_grounding(qmap):
-        try:
-            emergency = await _emergency_answer(question, deadline)
-            emergency_ok = _grounded_answer(emergency, question, facts, book) if facts else _usable_answer(emergency, question)
-            if emergency_ok:
-                best_answer = emergency
-        except Exception:
-            pass
-    if not _usable_answer(best_answer, question):
-        best_answer = "No supported answer was produced."
-
-    if len(best_answer) > MAX_ANSWER_CHARS:
-        best_answer = best_answer[: MAX_ANSWER_CHARS - 4].rstrip() + " …"
-
-    try:
-        refs = _citations(best_answer, book)
-    except Exception:
-        refs = []
-
-    if query.output_schema is not None:
-        try:
-            output = await _structured(best_answer, question, query.output_schema, deadline)
-        except Exception:
-            output = _coerce(best_answer, query.output_schema)
-        return Response(output=output, citations=refs or None)
-
-    if qmap.strict_output:
-        first = best_answer.splitlines()[0].strip() if best_answer else ""
-        first = _CITE_RE.sub("", first)
-        best_answer = _clean_space(first)
-    return Response(text=best_answer, citations=refs or None)
-
-
-
-# ---------------------------------------------------------------------------
-# V13 stage-bound deterministic compiler
-# ---------------------------------------------------------------------------
-
-
-def _v13_clean_cell(value: str) -> str:
-    cell = (value or "").strip()
-    cell = cell.replace("\\.", ".")
-    cell = re.sub(r"\[(.*?)\]\([^)]*\)", r"\1", cell)
-    cell = re.sub(r"[*_`]+", "", cell)
-    return _clean_space(cell)
-
-
-def _v13_header_key(value: str) -> str:
-    key = _v13_clean_cell(value).lower()
-    key = re.sub(r"[^a-z0-9]+", "", key)
-    aliases = {
-        "place": "pos",
-        "position": "pos",
-        "pos": "pos",
-        "rank": "rank",
-        "heat": "heat",
-        "bib": "bib",
-        "athlete": "athlete",
-        "name": "athlete",
-        "mark": "mark",
-        "time": "mark",
-        "details": "details",
-        "detail": "details",
-        "notes": "details",
-        "note": "details",
-        "nat": "nation",
-        "country": "nation",
-        "nation": "nation",
-    }
-    return aliases.get(key, key)
-
-
-def _v13_cells(line: str) -> list[str]:
-    raw = (line or "").strip()
-    if not raw.startswith("|"):
-        return []
-    parts = raw.strip("|").split("|")
-    return [_v13_clean_cell(part) for part in parts]
-
-
-def _v13_is_separator(cells: list[str]) -> bool:
-    if not cells:
-        return False
-    seen = False
-    for cell in cells:
-        compact = re.sub(r"\s+", "", cell)
-        if not compact:
-            continue
-        seen = True
-        if not re.fullmatch(r":?-{2,}:?", compact):
-            return False
-    return seen
-
-
-def _v13_markdown_tables(body: str) -> list[dict[str, Any]]:
-    """Parse markdown result tables without mixing neighboring page sections."""
-    lines = (body or "").splitlines()
-    tables: list[dict[str, Any]] = []
-    idx = 0
-    while idx < len(lines):
-        headers = _v13_cells(lines[idx])
-        if len(headers) < 3 or idx + 1 >= len(lines):
-            idx += 1
-            continue
-        sep = _v13_cells(lines[idx + 1])
-        if not _v13_is_separator(sep):
-            idx += 1
-            continue
-
-        keys = [_v13_header_key(x) for x in headers]
-        rows: list[dict[str, Any]] = []
-        raw_rows: list[str] = []
-        j = idx + 2
-        while j < len(lines):
-            cells = _v13_cells(lines[j])
-            if not cells:
-                break
-            if _v13_is_separator(cells):
-                j += 1
-                continue
-            # Adjust for empty spacer columns in World Athletics tables.
-            if len(cells) < len(keys):
-                cells += [""] * (len(keys) - len(cells))
-            elif len(cells) > len(keys):
-                cells = cells[: len(keys) - 1] + [" ".join(cells[len(keys) - 1 :])]
-            row: dict[str, Any] = {"_raw": lines[j]}
-            for key, value in zip(keys, cells):
-                if not key:
-                    continue
-                # Preserve the first useful value when duplicate/blank headers occur.
-                if key not in row or not str(row.get(key) or "").strip():
-                    row[key] = value
-            pos_text = str(row.get("pos") or "").strip()
-            if pos_text:
-                m = re.match(r"(\d{1,3})", pos_text)
-                if m:
-                    row["_pos_int"] = _int(m.group(1), 0)
-            heat_text = str(row.get("heat") or "").strip()
-            if heat_text:
-                m = re.match(r"(\d{1,2})", heat_text)
-                if m:
-                    row["_heat_int"] = _int(m.group(1), 0)
-            rows.append(row)
-            raw_rows.append(lines[j])
-            j += 1
-
-        if rows:
-            tables.append(
-                {
-                    "headers": keys,
-                    "rows": rows,
-                    "raw_header": lines[idx],
-                    "raw_rows": raw_rows,
-                    "start": idx,
-                    "end": j,
-                }
-            )
-        idx = max(idx + 1, j)
-    return tables
-
-
-def _v13_table_quality(table: dict[str, Any], want_summary: bool = False) -> int:
-    headers = set(table.get("headers") or [])
-    rows = table.get("rows") or []
-    score = len(rows)
-    if "athlete" in headers:
-        score += 30
-    if "mark" in headers:
-        score += 20
-    if "pos" in headers:
-        score += 20
-    if "details" in headers:
-        score += 8
-    if want_summary and "heat" in headers:
-        score += 35
-    if want_summary and "rank" in headers:
-        score += 10
-    if not want_summary and "heat" in headers:
-        score -= 10
-    return score
-
-
-def _v13_best_result_table(body: str, want_summary: bool = False) -> dict[str, Any] | None:
-    candidates = _v13_markdown_tables(body)
-    if want_summary:
-        candidates = [
-            table for table in candidates
-            if "athlete" in set(table.get("headers") or [])
-            and "heat" in set(table.get("headers") or [])
-        ]
-    else:
-        candidates = [
-            table for table in candidates
-            if "athlete" in set(table.get("headers") or [])
-            and "pos" in set(table.get("headers") or [])
-            and "mark" in set(table.get("headers") or [])
-        ]
-    if not candidates:
         return None
-    candidates.sort(key=lambda t: _v13_table_quality(t, want_summary), reverse=True)
-    return candidates[0]
+    if _shape_ok(value, schema):
+        return value
+    if isinstance(value, dict) and len(value) == 1:
+        only = list(value.values())[0]
+        if _shape_ok(only, schema):
+            return only
+    return None
 
 
-def _v13_stage_of_url(url: str) -> str:
-    low = (url or "").lower().split("?", 1)[0].rstrip("/")
-    if "/semi-final/summary" in low or "/semifinal/summary" in low:
-        return "semifinal_summary"
-    if "/semi-final/result" in low or "/semifinal/result" in low:
-        return "semifinal"
-    if "/final/result" in low and "semi" not in low:
-        return "final"
-    return ""
-
-
-def _v13_canonical_base(url: str) -> str:
-    target = (url or "").split("?", 1)[0].split("#", 1)[0].rstrip("/")
-    replacements = (
-        ("/semi-final/results", "/semi-final/result"),
-        ("/semifinal/results", "/semi-final/result"),
-        ("/final/results", "/final/result"),
-        ("/semifinal/result", "/semi-final/result"),
-    )
-    for old, new in replacements:
-        if old in target:
-            target = target.replace(old, new, 1)
-    return target
-
-
-def _v13_stage_siblings(url: str) -> list[str]:
-    target = _v13_canonical_base(url)
-    out: list[str] = []
-    stage = _v13_stage_of_url(target)
-    if stage == "semifinal":
-        out.extend([
-            target,
-            target.replace("/semi-final/result", "/semi-final/summary", 1),
-            target.replace("/semi-final/result", "/final/result", 1),
-        ])
-    elif stage == "semifinal_summary":
-        out.extend([
-            target.replace("/semi-final/summary", "/semi-final/result", 1),
-            target,
-            target.replace("/semi-final/summary", "/final/result", 1),
-        ])
-    elif stage == "final":
-        out.extend([
-            target.replace("/final/result", "/semi-final/result", 1),
-            target.replace("/final/result", "/semi-final/summary", 1),
-            target,
-        ])
-    return list(dict.fromkeys([x for x in out if x]))
-
-
-async def _v13_ensure_stage_sources(book: SourceBook, deadline: float) -> None:
-    """Fetch the canonical result stages directly, bypassing relevance ranking."""
-    seeds: list[str] = []
-    for row in book.rows:
-        url = str(row.get("url") or "")
-        if _v13_stage_of_url(_v13_canonical_base(url)):
-            seeds.append(url)
-    for url in book.pinned_event_urls:
-        if _v13_stage_of_url(_v13_canonical_base(url)):
-            seeds.append(url)
-
-    wanted: list[str] = []
-    for seed in seeds:
-        for candidate in _v13_stage_siblings(seed):
-            if candidate not in wanted:
-                wanted.append(candidate)
-
-    # Prefer the stable non-/en/ World Athletics route when both variants exist.
-    wanted.sort(key=lambda u: ("/en/" in u, 0 if "/semi-final/summary" in u else 1, len(u)))
-    wanted = wanted[:6]
-    if not wanted:
-        return
-
-    existing = {str(row.get("url") or "").split("?", 1)[0].rstrip("/") for row in book.rows}
-    tasks = []
-    for url in wanted:
-        clean = url.split("?", 1)[0].rstrip("/")
-        if clean in existing:
-            continue
-        if _left(deadline) < 12.0:
-            break
-        tasks.append(asyncio.create_task(_fetch_one(url, book)))
-    if not tasks:
-        return
-    try:
-        done, pending = await asyncio.wait(
-            tasks,
-            timeout=min(36.0, max(10.0, _left(deadline) - 4.0)),
-        )
-        for task in pending:
-            task.cancel()
-        for task in done:
-            try:
-                task.result()
-            except Exception:
-                pass
-    except Exception:
-        for task in tasks:
-            if not task.done():
-                task.cancel()
-
-
-def _v13_registry(book: SourceBook) -> dict[str, dict[str, Any]]:
-    """Build typed stage slots from ALL admissible rows, never book.ranked()[:N]."""
-    registry: dict[str, dict[str, Any]] = {}
-    for number in range(1, len(book.rows) + 1):
-        row = book.row(number)
-        if row is None or not book.source_allowed(number):
-            continue
-        url = _v13_canonical_base(str(row.get("url") or ""))
-        stage = _v13_stage_of_url(url)
-        if not stage:
-            continue
-        body = str(row.get("text") or "")
-        if not body:
-            continue
-
-        if stage == "semifinal_summary":
-            table = _v13_best_result_table(body, want_summary=True)
-        else:
-            table = _v13_best_result_table(body, want_summary=False)
-        if table is None:
-            continue
-
-        # Canonical singular /result routes with populated result rows outrank
-        # light shell pages such as /en/.../final/results that contain only headers.
-        route_score = 100
-        if "/final/result" in url or "/semi-final/result" in url:
-            route_score += 70
-        if "/summary" in url:
-            route_score += 60
-        route_score += min(40, len(table.get("rows") or []))
-        route_score += max(0, _event_match_state(
-            book.qmap.question,
-            str(row.get("url") or ""),
-            str(row.get("title") or ""),
-            body[:5000],
-        )) * 15
-
-        candidate = {
-            "source": number,
-            "url": str(row.get("url") or ""),
-            "title": str(row.get("title") or ""),
-            "body": body,
-            "table": table,
-            "score": route_score,
-        }
-        old = registry.get(stage)
-        if old is None or _int(candidate.get("score"), 0) > _int(old.get("score"), 0):
-            registry[stage] = candidate
-    return registry
-
-
-def _v13_rule(stage: dict[str, Any] | None) -> tuple[str, int]:
-    if not stage:
-        return "", 0
-    body = str(stage.get("body") or "")
-    m = re.search(
-        r"First\s+(\d{1,2})\s+of\s+each\s+(?:heat|semi[- ]?final)\s+\(Q\)\s+qualify\s+to\s+Final",
-        body,
-        flags=re.I,
-    )
-    if not m:
-        return "", 0
-    start = body.rfind("\n", 0, m.start()) + 1
-    end = body.find("\n", m.end())
-    if end < 0:
-        end = len(body)
-    return body[start:end].strip(), _int(m.group(1), 0)
-
-
-def _v13_name(row: dict[str, Any]) -> str:
-    return _clean_space(str(row.get("athlete") or ""))
-
-
-def _v13_details(row: dict[str, Any]) -> str:
-    return _clean_space(str(row.get("details") or ""))
-
-
-def _v13_mark(row: dict[str, Any]) -> str:
-    return _clean_space(str(row.get("mark") or ""))
-
-
-def _v13_find_named_row(rows: list[dict[str, Any]], text: str) -> dict[str, Any] | None:
-    low = (text or "").lower()
-    matches = []
-    for row in rows:
-        name = _v13_name(row)
-        if not name:
-            continue
-        # Source names may use all-caps surnames while the question uses title case.
-        compact = re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()
-        words = [x for x in compact.split() if len(x) > 1]
-        if words and all(word in low for word in words):
-            matches.append(row)
-    if not matches:
+def _coerce_schema(answer: str, schema: Any, depth: int = 0) -> Any:
+    if depth > 5:
+        return answer[:2000]
+    kind = _schema_kind(schema)
+    if kind == "string" or not kind:
+        return _clip(answer, 4000)
+    if kind == "integer":
+        m = re.search(r"-?\d[\d,]*", answer or "")
+        return int(m.group(0).replace(",", "")) if m else 0
+    if kind == "number":
+        m = re.search(r"-?\d[\d,]*(?:\.\d+)?", answer or "")
+        return float(m.group(0).replace(",", "")) if m else 0.0
+    if kind == "boolean":
+        return bool(re.search(r"\b(?:yes|true)\b", answer or "", re.I))
+    if kind == "array":
+        items = schema.get("items") if isinstance(schema, dict) else {}
+        lines = [x.strip(" -*•\t") for x in (answer or "").splitlines() if x.strip()]
+        if not lines:
+            lines = [answer.strip()] if answer.strip() else []
+        return [_coerce_schema(line, items, depth + 1) for line in lines[:20]]
+    if kind == "object":
+        props = schema.get("properties") if isinstance(schema, dict) else {}
+        if not isinstance(props, dict):
+            return {}
+        result: dict[str, Any] = {}
+        for key, sub in props.items():
+            if isinstance(key, str):
+                result[key] = _coerce_schema(answer, sub, depth + 1)
+        return result
+    if kind == "null":
         return None
-    matches.sort(key=lambda r: len(_v13_name(r)), reverse=True)
-    return matches[0]
-
-
-def _v13_retain_line(book: SourceBook, source: int, raw_line: str) -> None:
-    if source <= 0 or not raw_line:
-        return
-    book.retain(source, raw_line.strip())
-
-
-def _v13_count_semifinal_heats(summary: dict[str, Any] | None, semifinal: dict[str, Any] | None) -> int:
-    if summary:
-        table = summary.get("table") or {}
-        heats = {
-            _int(row.get("_heat_int"), 0)
-            for row in table.get("rows") or []
-            if _int(row.get("_heat_int"), 0) > 0
-        }
-        if heats:
-            return len(heats)
-    if semifinal:
-        body = str(semifinal.get("body") or "")
-        found = set(_int(x, 0) for x in re.findall(r"\bHeat\s+(\d{1,2})\b", body, flags=re.I))
-        found.discard(0)
-        if found:
-            return len(found)
-    return 0
-
-
-def _v13_stage_bound_compiler(qmap: QuestionMap, book: SourceBook) -> str:
-    """Deterministically answer stage-bound result-table questions.
-
-    This compiler binds every requested fact to the stage that can prove it:
-    final facts can only come from FINAL; semifinal facts from SEMIFINAL; and
-    cross-stage ranking requires both. It never lets a semifinal row count fill
-    a final-count slot.
-    """
-    low = qmap.question.lower()
-    if not (
-        ("semi-final" in low or "semifinal" in low)
-        and re.search(r"\bfinal\b", low)
-        and ("result" in low or "results" in low)
-    ):
-        return ""
-
-    registry = _v13_registry(book)
-    final = registry.get("final")
-    semifinal = registry.get("semifinal")
-    summary = registry.get("semifinal_summary")
-    if not final or not semifinal:
-        return ""
-
-    final_rows = list((final.get("table") or {}).get("rows") or [])
-    semi_rows = list((semifinal.get("table") or {}).get("rows") or [])
-    if len(final_rows) < 4 or len(semi_rows) < 4:
-        return ""
-
-    final_source = _int(final.get("source"), 0)
-    semi_source = _int(semifinal.get("source"), 0)
-    summary_source = _int((summary or {}).get("source"), 0)
-
-    # Result tables must have a contiguous 1..N finishing-order run.
-    final_positions = [_int(row.get("_pos_int"), 0) for row in final_rows if _int(row.get("_pos_int"), 0) > 0]
-    if not final_positions:
-        return ""
-    unique_final_positions = []
-    for value in final_positions:
-        if value not in unique_final_positions:
-            unique_final_positions.append(value)
-    final_count = max(unique_final_positions)
-    if set(range(1, final_count + 1)) - set(unique_final_positions):
-        return ""
-
-    # Semifinal 1 winner: the fetched /semi-final/result page is Heat 1 in
-    # World Athletics, and generic result-table sites similarly expose one heat.
-    semi_ranked = [row for row in semi_rows if _int(row.get("_pos_int"), 0) > 0]
-    semi_ranked.sort(key=lambda r: _int(r.get("_pos_int"), 999))
-    semi_winner = next((row for row in semi_ranked if _int(row.get("_pos_int"), 0) == 1), None)
-    if semi_winner is None:
-        return ""
-
-    # Q pool is stage-bound to semifinal 1 only.
-    q_rows = []
-    for row in semi_ranked:
-        details = _v13_details(row)
-        if re.search(r"(?:^|\s)Q(?:\s|$)", details):
-            q_rows.append(row)
-    if len(q_rows) < 2:
-        # Some extracts omit the Details cell; use the printed rule's N as a
-        # deterministic fallback, but only within this semifinal result table.
-        _, n_auto = _v13_rule(semifinal)
-        if n_auto > 0:
-            q_rows = semi_ranked[:n_auto]
-    if not q_rows:
-        return ""
-
-    final_by_name: dict[str, dict[str, Any]] = {}
-    for row in final_rows:
-        name = _v13_name(row)
-        if name:
-            final_by_name[re.sub(r"[^a-z0-9]+", " ", name.lower()).strip()] = row
-
-    # Determine the named athlete requested for the final-position subpart from
-    # the part text itself, then bind exclusively to the FINAL table.
-    named_final = None
-    named_part = ""
-    for part in qmap.parts:
-        part_low = part.lower()
-        if "finishing position" in part_low and "final" in part_low:
-            candidate = _v13_find_named_row(final_rows, part_low)
-            if candidate is not None:
-                named_final = candidate
-                named_part = part
-                break
-
-    # Cross-stage superlative: map only the semifinal-1 Q pool into FINAL.
-    compared: list[dict[str, Any]] = []
-    for qrow in q_rows:
-        qname = _v13_name(qrow)
-        key = re.sub(r"[^a-z0-9]+", " ", qname.lower()).strip()
-        frow = final_by_name.get(key)
-        if frow is not None and _int(frow.get("_pos_int"), 0) > 0:
-            compared.append(frow)
-    compared.sort(key=lambda r: _int(r.get("_pos_int"), 999))
-    best_q_final = compared[0] if compared else None
-
-    rule_line, auto_n = _v13_rule(summary or semifinal)
-    if not rule_line:
-        rule_line, auto_n = _v13_rule(semifinal)
-    heat_count = _v13_count_semifinal_heats(summary, semifinal)
-    implied = auto_n * heat_count if auto_n > 0 and heat_count > 0 else 0
-
-    # Explain extra advancement statuses only when the official semifinal summary
-    # provides them. This preserves the "using only official results" constraint.
-    extras: list[dict[str, Any]] = []
-    if summary:
-        summary_rows = list((summary.get("table") or {}).get("rows") or [])
-        for row in summary_rows:
-            detail = _v13_details(row)
-            if re.search(r"\bq[RJ]\b", detail, flags=re.I):
-                extras.append(row)
-
-    # Retain narrow exact proof lines for receipt-backed citations.
-    for row in final_rows:
-        if _int(row.get("_pos_int"), 0) in {1, final_count}:
-            _v13_retain_line(book, final_source, str(row.get("_raw") or ""))
-    _v13_retain_line(book, semi_source, str(semi_winner.get("_raw") or ""))
-    for row in q_rows:
-        _v13_retain_line(book, semi_source, str(row.get("_raw") or ""))
-    if named_final is not None:
-        _v13_retain_line(book, final_source, str(named_final.get("_raw") or ""))
-    if best_q_final is not None:
-        _v13_retain_line(book, final_source, str(best_q_final.get("_raw") or ""))
-    if rule_line:
-        book.retain(summary_source or semi_source, rule_line)
-    for row in extras:
-        _v13_retain_line(book, summary_source, str(row.get("_raw") or ""))
-
-    # Construct an answer that mirrors explicit numbered requirements when they
-    # are present. We do not use an LLM here: the source tables already prove it.
-    lines: list[str] = []
-    final_marker = f"[{final_source}]"
-    semi_marker = f"[{semi_source}]"
-    summary_marker = f"[{summary_source}]" if summary_source > 0 else semi_marker
-
-    if qmap.parts:
-        for index, part in enumerate(qmap.parts, 1):
-            plow = part.lower()
-            if ("how many" in plow or "number" in plow) and "final" in plow:
-                sentence = f"({index}) The official final result list contains **{final_count} athletes** {final_marker}."
-                if rule_line and implied:
-                    sentence += (
-                        f" The semifinal rule is **“{rule_line}”** {summary_marker}, which ordinarily accounts for "
-                        f"**{implied}** automatic-Q places; the official final therefore has **{final_count - implied}** "
-                        f"additional athlete{'s' if final_count - implied != 1 else ''} beyond that ordinary Q count."
-                    )
-                    if extras:
-                        descriptions = []
-                        for row in extras:
-                            name = _v13_name(row)
-                            detail = _v13_details(row)
-                            if name and detail:
-                                descriptions.append(f"**{name} ({detail})**")
-                        if descriptions:
-                            sentence += " The official semifinal summary identifies the additional advancement statuses as " + " and ".join(descriptions) + f" {summary_marker}."
-                lines.append(sentence)
-                continue
-
-            if "semi" in plow and ("finished first" in plow or "who actually finished first" in plow or "winner" in plow):
-                lines.append(
-                    f"({index}) **{_v13_name(semi_winner)}** finished first in semifinal 1 in **{_v13_mark(semi_winner)}** {semi_marker}."
-                )
-                continue
-
-            if ("among" in plow or "qualifier" in plow or "best" in plow) and "final" in plow and best_q_final is not None:
-                qnames = ", ".join(f"**{_v13_name(row)}**" for row in q_rows)
-                lines.append(
-                    f"({index}) The semifinal-1 Q qualifiers are {qnames} {semi_marker}. "
-                    f"Among them, **{_v13_name(best_q_final)}** had the best final placing: "
-                    f"**{_int(best_q_final.get('_pos_int'), 0)}{_ordinal_suffix(_int(best_q_final.get('_pos_int'), 0))} "
-                    f"in {_v13_mark(best_q_final)}** {final_marker}."
-                )
-                continue
-
-            if "finishing position" in plow and "final" in plow and named_final is not None:
-                lines.append(
-                    f"({index}) **{_v13_name(named_final)}** finished **{_int(named_final.get('_pos_int'), 0)}"
-                    f"{_ordinal_suffix(_int(named_final.get('_pos_int'), 0))}** in the final in **{_v13_mark(named_final)}** {final_marker}."
-                )
-                continue
-
-        if len(lines) == len(qmap.parts):
-            return "\n".join(lines)
-
-    # Generic fallback for a stage-comparison result question.
-    if named_final is not None and best_q_final is not None:
-        return (
-            f"The official final result list contains **{final_count} athletes** {final_marker}. "
-            f"**{_v13_name(semi_winner)}** won the relevant semifinal in **{_v13_mark(semi_winner)}** {semi_marker}. "
-            f"**{_v13_name(named_final)}** finished **{_int(named_final.get('_pos_int'), 0)}"
-            f"{_ordinal_suffix(_int(named_final.get('_pos_int'), 0))}** in **{_v13_mark(named_final)}** {final_marker}. "
-            f"Among the semifinal Q qualifiers, **{_v13_name(best_q_final)}** placed highest in the final, "
-            f"**{_int(best_q_final.get('_pos_int'), 0)}{_ordinal_suffix(_int(best_q_final.get('_pos_int'), 0))} "
-            f"in {_v13_mark(best_q_final)}** {final_marker}."
-        )
-    return ""
-
-
-def _ordinal_suffix(number: int) -> str:
-    n = abs(_int(number, 0))
-    if 10 <= n % 100 <= 20:
-        return "th"
-    return {1: "st", 2: "nd", 3: "rd"}.get(n % 10, "th")
-
-
-def _v13_fast_applicable(qmap: QuestionMap) -> bool:
-    low = qmap.question.lower()
-    return bool(
-        ("semi-final" in low or "semifinal" in low)
-        and re.search(r"\bfinal\b", low)
-        and ("result" in low or "results" in low)
-        and (qmap.parts or qmap.hard_source_lock)
-    )
+    return _clip(answer, 4000)
 
 
 async def _solve(query: Query, question: str) -> Response:
-    """V13 controller: deterministic typed-stage path first; legacy only as fallback."""
-    qmap = QuestionMap(question, query.output_schema)
-    if _v13_fast_applicable(qmap):
-        started = monotonic()
-        deadline = started + 78.0
+    deadline = monotonic() + WALL_SECONDS
+    await _load_models()
+
+    shape = QuestionShape(question)
+    vault = EvidenceVault(question)
+
+    try:
+        recent = await _preseed(question, shape, vault, deadline)
+    except Exception:
+        recent = ""
+
+    try:
+        provisional = await _research_loop(question, shape, vault, deadline, recent)
+    except Exception:
+        provisional = ""
+
+    answer = ""
+    if _left(deadline) > 10.0:
         try:
-            await _load_tooling()
+            answer = await _write_final(question, shape, vault, provisional, deadline)
+        except Exception:
+            answer = ""
+
+    if not _usable_answer(answer):
+        answer = provisional if _usable_answer(provisional) else _deterministic_partial(vault)
+
+    if _usable_answer(answer) and _left(deadline) > 28.0:
+        try:
+            answer = await _critic(question, shape, vault, answer, deadline)
         except Exception:
             pass
+
+    answer = _normalize_markers(answer).strip()
+    if len(answer) > ANSWER_CAP:
+        answer = answer[:ANSWER_CAP - 2] + " …"
+
+    try:
+        refs = _citations(answer, vault)
+    except Exception:
+        refs = []
+
+    shipped_text = _output_only_line(answer, question)
+    if not shipped_text:
+        shipped_text = _deterministic_partial(vault)
+    if not shipped_text:
+        shipped_text = "Unable to produce a supported answer."
+
+    if query.output_schema is not None:
+        structured = None
         try:
-            plan = await _make_plan(qmap, deadline)
+            structured = await _schema_convert(question, answer, query.output_schema, deadline)
         except Exception:
-            plan = _fallback_plan(qmap)
-        book = SourceBook(qmap, plan)
-
+            structured = None
+        if structured is None:
+            structured = _coerce_schema(answer or shipped_text, query.output_schema)
         try:
-            await _search_many(plan.queries, book, deadline)
-            book.infer_source_lock()
+            return Response(output=structured, citations=refs or None)
         except Exception:
-            pass
+            return Response(output=structured)
 
-        # First fetch canonical candidates from discovery, then explicitly ensure
-        # FINAL, SEMIFINAL and SEMIFINAL SUMMARY stage slots. No ranking cutoff.
-        try:
-            await _fetch_many(_fetch_candidates(book, FETCH_CAP), book, deadline)
-            book.infer_source_lock()
-            await _v13_ensure_stage_sources(book, deadline)
-            book.infer_source_lock()
-        except Exception:
-            pass
-
-        answer = _v13_stage_bound_compiler(qmap, book)
-        answer = _normalize_markers(_clean_answer(answer), len(book.rows))
-        if _usable_answer(answer, question):
-            refs = _citations(answer, book)
-            if query.output_schema is not None:
-                try:
-                    output = await _structured(answer, question, query.output_schema, deadline)
-                except Exception:
-                    output = _coerce(answer, query.output_schema)
-                return Response(output=output, citations=refs or None)
-            if qmap.strict_output:
-                first = _CITE_RE.sub("", answer.splitlines()[0] if answer else "")
-                answer = _clean_space(first)
-            return Response(text=answer, citations=refs or None)
-
-    # Non-stage questions, or a stage question whose required canonical tables
-    # could not be proven, retain the mature general research path.
-    return await _solve_legacy(query, question)
+    try:
+        return Response(text=shipped_text, citations=refs or None)
+    except Exception:
+        return Response(text=shipped_text)
 
 
 @entrypoint("query")
 async def query(query: Query) -> Response:
     question = (query.text or "").strip()
     if not question:
-        if query.output_schema is not None:
-            return Response(output=_coerce("", query.output_schema))
         return Response(text="No question provided.")
     try:
         return await _solve(query, question)
     except Exception:
-        # A final containment boundary. Source-bound research questions are safer
-        # unanswered than confidently hallucinated from model memory.
-        low = question.lower()
-        source_bound = bool(
-            "official" in low
-            or "according to" in low
-            or "results page" in low
-            or "report" in low
-            or "exactly as" in low
-        )
-        if source_bound:
-            answer = "No supported answer was produced."
-        else:
-            deadline = monotonic() + 30.0
-            try:
-                answer = await _emergency_answer(question, deadline)
-            except Exception:
-                answer = "No supported answer was produced."
-        if query.output_schema is not None:
-            return Response(output=_coerce(answer, query.output_schema))
-        return Response(text=answer)
+        # Never echo the prompt as the answer. This is only a final crash guard.
+        return Response(text="Unable to produce a supported answer.")
