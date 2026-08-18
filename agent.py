@@ -28,26 +28,26 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "orbit-evidence-v14.0"
+VERSION = "orbit-evidence-v15.0-openrouter-deeploop"
 
-LLM_PROVIDER = "chutes"
+LLM_PROVIDER = "openrouter"
 SEARCH_PROVIDER = "parallel"
 
-WALL_SECONDS = 172.0
-WRAPUP_SECONDS = 52.0
-MIN_RETURN_SECONDS = 7.0
-MAX_RESEARCH_TURNS = 6
-MAX_ACTIONS_PER_TURN = 6
+WALL_SECONDS = 262.0
+WRAPUP_SECONDS = 86.0
+MIN_RETURN_SECONDS = 8.0
+MAX_RESEARCH_TURNS = 12
+MAX_ACTIONS_PER_TURN = 7
 
-SEARCH_TIMEOUT = 13.0
-FETCH_TIMEOUT = 17.0
-TOOL_PHASE_TIMEOUT = 22.0
-TURN_TIMEOUT = 30.0
-WRITER_TIMEOUT = 34.0
-CRITIC_TIMEOUT = 19.0
-SCHEMA_TIMEOUT = 24.0
+SEARCH_TIMEOUT = 18.0
+FETCH_TIMEOUT = 16.0
+TOOL_PHASE_TIMEOUT = 28.0
+TURN_TIMEOUT = 60.0
+WRITER_TIMEOUT = 52.0
+CRITIC_TIMEOUT = 28.0
+SCHEMA_TIMEOUT = 36.0
 
-SEARCH_RESULTS = 8
+SEARCH_RESULTS = 10
 SEARCH_NOTE_SHOW = 720
 FETCH_WINDOW = 3400
 FETCH_WINDOWS = 3
@@ -56,11 +56,11 @@ LOCAL_WINDOW = 1100
 LOCAL_HITS = 5
 LOCAL_READ_CAP = 12000
 
-DIGEST_CHARS = 52000
+DIGEST_CHARS = 82000
 ROW_DIGEST_CAP = 7200
 ANSWER_CAP = 52000
 MAX_CITATIONS = 22
-TOTAL_EVIDENCE_CAP = 92000
+TOTAL_EVIDENCE_CAP = 140000
 CITATION_TARGET = 4800
 CITATION_ROW_CAP = 10500
 
@@ -69,17 +69,22 @@ MAX_KEPT_PER_ROW = 6
 MIN_QUOTE = 10
 
 PRIMARY_MODELS = (
+    "z-ai/glm-5.2",
+    "deepseek/deepseek-v3.2",
+    "openai/gpt-oss-120b",
+    "z-ai/glm-5",
+    "qwen/qwen3.6-30b-a3b-instruct",
+    "google/gemini-2.5-flash",
     "deepseek-ai/DeepSeek-V3.2-TEE",
     "Qwen/Qwen3.6-27B-TEE",
-    "Qwen/Qwen3.5-397B-A17B-TEE",
-    "google/gemma-4-31B-turbo-TEE",
-    "moonshotai/Kimi-K2.6-TEE",
 )
 
 WRITER_MODELS = (
+    "openai/gpt-oss-120b",
+    "deepseek/deepseek-v3.2",
+    "z-ai/glm-5.2",
+    "google/gemini-2.5-flash",
     "deepseek-ai/DeepSeek-V3.2-TEE",
-    "google/gemma-4-31B-turbo-TEE",
-    "Qwen/Qwen3.6-27B-TEE",
 )
 
 _STATE: dict[str, Any] = {
@@ -560,16 +565,20 @@ def _model_order(preferred: tuple[str, ...]) -> list[str]:
         # Prefer generally capable research/synthesis families over embedding-ish names.
         def rank(name: str) -> tuple[int, str]:
             low = name.lower()
-            if "deepseek-v3.2" in low:
+            if "glm-5.2" in low:
                 return (0, low)
-            if "qwen3.6" in low:
+            if "gpt-oss-120b" in low:
                 return (1, low)
-            if "gemma-4-31b" in low:
+            if "deepseek" in low and "v3.2" in low:
                 return (2, low)
-            if "kimi" in low:
+            if "glm-5" in low:
                 return (3, low)
-            if "glm" in low:
+            if "qwen3.6" in low or "qwen3" in low:
                 return (4, low)
+            if "gemini-2.5" in low or "gemma-4-31b" in low:
+                return (5, low)
+            if "kimi" in low:
+                return (6, low)
             return (9, low)
         remainder.sort(key=rank)
         return (chosen + remainder)[:5]
