@@ -31,6 +31,7 @@ from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 VERSION = "orbit-evidence-v15.0-openrouter-deeploop"
 
 LLM_PROVIDER = "openrouter"
+LLM_FALLBACK_PROVIDER = "chutes"
 SEARCH_PROVIDER = "parallel"
 
 WALL_SECONDS = 262.0
@@ -60,7 +61,7 @@ DIGEST_CHARS = 82000
 ROW_DIGEST_CAP = 7200
 ANSWER_CAP = 52000
 MAX_CITATIONS = 22
-TOTAL_EVIDENCE_CAP = 140000
+TOTAL_EVIDENCE_CAP = 110000
 CITATION_TARGET = 4800
 CITATION_ROW_CAP = 10500
 
@@ -90,6 +91,7 @@ WRITER_MODELS = (
 _STATE: dict[str, Any] = {
     "models": (),
     "budget_left": None,
+    "models_by_provider": {},
 }
 
 
@@ -537,27 +539,35 @@ async def _load_models() -> None:
         providers = response.get("allowed_llm_provider_models")
         if not isinstance(providers, dict):
             return
-        raw = providers.get(LLM_PROVIDER)
-        names: list[str] = []
-        if isinstance(raw, (list, tuple)):
-            for item in raw:
-                name = ""
-                if isinstance(item, str):
-                    name = item.strip()
-                elif isinstance(item, dict):
-                    candidate = item.get("model") or item.get("id") or item.get("name")
-                    if isinstance(candidate, str):
-                        name = candidate.strip()
-                if name and name not in names:
-                    names.append(name)
-        if names:
-            _STATE["models"] = tuple(names)
+        by_provider: dict[str, tuple[str, ...]] = {}
+        for provider in (LLM_PROVIDER, LLM_FALLBACK_PROVIDER):
+            raw = providers.get(provider)
+            names: list[str] = []
+            if isinstance(raw, (list, tuple)):
+                for item in raw:
+                    name = ""
+                    if isinstance(item, str):
+                        name = item.strip()
+                    elif isinstance(item, dict):
+                        candidate = item.get("model") or item.get("id") or item.get("name")
+                        if isinstance(candidate, str):
+                            name = candidate.strip()
+                    if name and name not in names:
+                        names.append(name)
+            if names:
+                by_provider[provider] = tuple(names)
+        if by_provider:
+            _STATE["models_by_provider"] = by_provider
+            _STATE["models"] = by_provider.get(LLM_PROVIDER) or next(iter(by_provider.values()))
     except Exception:
         return
 
 
-def _model_order(preferred: tuple[str, ...]) -> list[str]:
-    live = _STATE.get("models")
+def _model_order(preferred: tuple[str, ...], provider: str = LLM_PROVIDER) -> list[str]:
+    by_provider = _STATE.get("models_by_provider")
+    live = by_provider.get(provider) if isinstance(by_provider, dict) else None
+    if not live and provider == LLM_PROVIDER:
+        live = _STATE.get("models")
     if isinstance(live, tuple) and live:
         allowed = [x for x in live if isinstance(x, str) and x]
         chosen = [x for x in preferred if x in allowed]
@@ -588,22 +598,30 @@ def _model_order(preferred: tuple[str, ...]) -> list[str]:
 async def _chat(preferred: tuple[str, ...], messages: list[dict[str, Any]],
                 deadline: float, max_tokens: int, timeout_cap: float,
                 temperature: float = 0.1) -> Any:
-    models = _model_order(preferred)
-    for index, model in enumerate(models):
+    attempts: list[tuple[str, str]] = []
+    for provider, prefs in (
+        (LLM_PROVIDER, preferred),
+        (LLM_FALLBACK_PROVIDER, PRIMARY_MODELS + WRITER_MODELS),
+    ):
+        for model in _model_order(prefs, provider):
+            pair = (provider, model)
+            if pair not in attempts:
+                attempts.append(pair)
+    for index, (provider, model) in enumerate(attempts[:8]):
         remaining = _left(deadline)
         if remaining <= MIN_RETURN_SECONDS + 4.0:
             return None
         cap = timeout_cap
         if index == 1:
-            cap = min(cap, 20.0)
+            cap = min(cap, 24.0)
         elif index >= 2:
-            cap = min(cap, 15.0)
+            cap = min(cap, 18.0)
         timeout = min(cap, remaining - MIN_RETURN_SECONDS)
         if timeout <= 5.0:
             return None
         try:
             payload = await llm_chat(
-                provider=LLM_PROVIDER,
+                provider=provider,
                 model=model,
                 messages=messages,
                 temperature=temperature,
