@@ -1,17 +1,10 @@
 """
-Harnyx SN67 research miner — OrbitEvidence v14.
+Harnyx SN67 miner — AtlasQuorum v1.
 
-Independent implementation of a bounded research loop.  The controller lets the
-language model choose iterative research actions, but evidence storage, citation
-numbering, page navigation, time limits, final-answer validation, and structured
-output are deterministic.
-
-Configured for the credentials already used by this miner:
-- Parallel for search and page extraction.
-- Chutes for language-model calls.
-
-The design intentionally uses its own controller and data model rather than
-copying another miner implementation.
+A fresh, original evidence-first agent.  It uses a small quorum workflow instead
+of a champion-style tool loop: generate diverse search lanes, collect and fetch
+primary-looking sources, ask the model for a cited draft, run a targeted evidence
+repair pass, then emit schema-safe output with compact citation slices.
 """
 
 from __future__ import annotations
@@ -19,6 +12,7 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+from dataclasses import dataclass, field
 from time import monotonic
 from typing import Any
 from urllib.parse import urlparse
@@ -27,87 +21,63 @@ from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
+VERSION = "atlas-quorum-v1.0"
 
-VERSION = "orbit-evidence-v14.0"
-
-LLM_PROVIDER = "chutes"
 SEARCH_PROVIDER = "parallel"
+LLM_PROVIDERS = ("openrouter", "chutes")
 
-WALL_SECONDS = 172.0
-WRAPUP_SECONDS = 52.0
-MIN_RETURN_SECONDS = 7.0
-MAX_RESEARCH_TURNS = 6
-MAX_ACTIONS_PER_TURN = 6
+WALL_S = 255.0
+TAIL_S = 9.0
+SEARCH_S = 18.0
+FETCH_S = 18.0
+CHAT_S = 48.0
+REPAIR_S = 32.0
+SCHEMA_S = 28.0
 
-SEARCH_TIMEOUT = 13.0
-FETCH_TIMEOUT = 17.0
-TOOL_PHASE_TIMEOUT = 22.0
-TURN_TIMEOUT = 30.0
-WRITER_TIMEOUT = 34.0
-CRITIC_TIMEOUT = 19.0
-SCHEMA_TIMEOUT = 24.0
+SEARCH_NUM = 8
+MAX_SEARCHES = 6
+MAX_FETCHES = 9
+MAX_ROWS = 28
+SNIPPET_CHARS = 6200
+DIGEST_CHARS = 76000
+ANSWER_CHARS = 48000
+MAX_CITES = 18
+MAX_CITE_TOTAL = 108000
+CITE_TARGET = 5200
 
-SEARCH_RESULTS = 8
-SEARCH_NOTE_SHOW = 720
-FETCH_WINDOW = 3400
-FETCH_WINDOWS = 3
-FETCH_ORIENTATION = 1200
-LOCAL_WINDOW = 1100
-LOCAL_HITS = 5
-LOCAL_READ_CAP = 12000
-
-DIGEST_CHARS = 52000
-ROW_DIGEST_CAP = 7200
-ANSWER_CAP = 52000
-MAX_CITATIONS = 22
-TOTAL_EVIDENCE_CAP = 92000
-CITATION_TARGET = 4800
-CITATION_ROW_CAP = 10500
-
-KEEP_MARGIN = 420
-MAX_KEPT_PER_ROW = 6
-MIN_QUOTE = 10
-
-PRIMARY_MODELS = (
+PREFERRED_MODELS = (
+    "z-ai/glm-5.2",
+    "openai/gpt-oss-120b",
+    "deepseek/deepseek-v3.2",
+    "z-ai/glm-5",
+    "google/gemini-2.5-flash",
     "deepseek-ai/DeepSeek-V3.2-TEE",
-    "Qwen/Qwen3.6-27B-TEE",
-    "Qwen/Qwen3.5-397B-A17B-TEE",
-    "google/gemma-4-31B-turbo-TEE",
-    "moonshotai/Kimi-K2.6-TEE",
-)
-
-WRITER_MODELS = (
-    "deepseek-ai/DeepSeek-V3.2-TEE",
-    "google/gemma-4-31B-turbo-TEE",
     "Qwen/Qwen3.6-27B-TEE",
 )
 
-_STATE: dict[str, Any] = {
-    "models": (),
-    "budget_left": None,
-}
+STATE: dict[str, Any] = {"models": {}}
 
-
-def _remember_budget(payload: Any) -> None:
-    budget = getattr(payload, "budget", None)
-    value = getattr(budget, "session_remaining_budget_usd", None)
-    if isinstance(value, (int, float)):
-        _STATE["budget_left"] = float(value)
+_WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'.-]{2,}")
+_STOP = set(
+    "the and that for from with this those these which what when where why how who whom whose "
+    "are was were has have had been being into about over under between during before after "
+    "using only answer question provide official result results include following based according".split()
+)
+_CITE = re.compile(r"\[([0-9][0-9,\s-]*)\]")
+_NUM = re.compile(r"(?<!\[)\b\d[\d,]*(?:\.\d+)?%?\b")
 
 
 def _left(deadline: float) -> float:
     return deadline - monotonic()
 
 
-def _clip(value: str, limit: int) -> str:
-    text = (value or "").strip()
-    if len(text) <= limit:
-        return text
-    return text[: max(0, limit - 2)] + " …"
+def _clean(text: str) -> str:
+    return " ".join((text or "").split())
 
 
-def _space(value: str) -> str:
-    return " ".join((value or "").split())
+def _clip(text: str, n: int) -> str:
+    value = (text or "").strip()
+    return value if len(value) <= n else value[: max(0, n - 2)] + " …"
 
 
 def _host(url: str) -> str:
@@ -117,19 +87,10 @@ def _host(url: str) -> str:
         return ""
 
 
-_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'.-]{2,}")
-_STOP = frozenset(
-    "the and for with from that this these those which what when where who how "
-    "many much into over under between during after before while about against "
-    "also have has had was were are is be been being their there they them its "
-    "use using only official result results answer question according based".split()
-)
-
-
-def _terms(value: str, limit: int = 28) -> list[str]:
+def _terms(text: str, limit: int = 32) -> list[str]:
     out: list[str] = []
     seen: set[str] = set()
-    for token in _WORD_RE.findall((value or "").lower()):
+    for token in _WORD.findall((text or "").lower()):
         if token in _STOP or len(token) < 3:
             continue
         if token not in seen:
@@ -140,1351 +101,508 @@ def _terms(value: str, limit: int = 28) -> list[str]:
     return out
 
 
-def _overlap_score(text: str, terms: list[str]) -> int:
+def _score_text(text: str, terms: list[str]) -> int:
     low = (text or "").lower()
-    score = 0
-    for token in terms:
-        if token in low:
-            score += 1
-    return score
+    return sum(1 for term in terms if term in low)
 
 
-def _merge_ranges(spans: list[tuple[int, int]], size: int) -> list[tuple[int, int]]:
-    clean: list[tuple[int, int]] = []
-    for a, b in spans:
-        start = max(0, min(int(a), size))
-        end = max(start, min(int(b), size))
-        if end > start:
-            clean.append((start, end))
-    clean.sort()
-    merged: list[list[int]] = []
-    for start, end in clean:
-        if merged and start <= merged[-1][1] + 80:
-            merged[-1][1] = max(merged[-1][1], end)
-        else:
-            merged.append([start, end])
-    return [(x[0], x[1]) for x in merged]
+def _question_flags(question: str) -> dict[str, bool]:
+    q = question.lower()
+    return {
+        "set": bool(re.search(r"\b(which|what|list|all|how many|count|identify)\b", q)),
+        "rank": bool(re.search(r"\b(first|last|largest|smallest|highest|lowest|most|least|rank|oldest|youngest)\b", q)),
+        "source_limited": bool(re.search(r"\b(using only|according to|from the .* (?:site|database|report|filing)|solely)\b", q)),
+        "bare": bool(re.search(r"\b(output only|answer only|exact text|return only|provide only)\b", q)),
+    }
 
 
-def _window_spans(text: str, focus: str, width: int = FETCH_WINDOW,
-                  count: int = FETCH_WINDOWS) -> list[tuple[int, int]]:
-    n = len(text or "")
-    if n <= width:
-        return [(0, n)] if n else []
-    wanted = _terms(focus, 34)
+@dataclass
+class Row:
+    receipt_id: str
+    result_id: str
+    title: str
+    url: str
+    text: str
+    kind: str
+    spans: list[tuple[int, int]] = field(default_factory=list)
+
+
+class Notebook:
+    def __init__(self, question: str) -> None:
+        self.question = question
+        self.rows: list[Row] = []
+        self.seen_urls: set[str] = set()
+
+    def add(self, row: Row) -> int | None:
+        if len(self.rows) >= MAX_ROWS or not row.receipt_id or not row.result_id or not row.text.strip():
+            return None
+        key = row.url.lower().split("#", 1)[0]
+        if key and key in self.seen_urls and row.kind == "fetch":
+            return None
+        if key:
+            self.seen_urls.add(key)
+        self.rows.append(row)
+        return len(self.rows)
+
+    def render(self, cap: int = DIGEST_CHARS) -> str:
+        if not self.rows:
+            return "(no evidence)"
+        terms = _terms(self.question)
+        ranked: list[tuple[int, int, Row]] = []
+        for idx, row in enumerate(self.rows, 1):
+            h = _host(row.url)
+            primary = 8 if any(x in h for x in (".gov", "sec.gov", "edu", "int", "who.int", "worldbank", "un.org")) else 0
+            fetch = 5 if row.kind == "fetch" else 0
+            ranked.append((_score_text(row.title + " " + row.url + " " + row.text[:1800], terms) * 4 + primary + fetch, idx, row))
+        ranked.sort(key=lambda x: (-x[0], x[1]))
+        chunks: list[str] = []
+        used = 0
+        for _, idx, row in ranked:
+            pieces = []
+            spans = row.spans or [(0, min(len(row.text), SNIPPET_CHARS))]
+            for a, b in spans[:3]:
+                pieces.append(row.text[max(0, a): min(len(row.text), b)].strip())
+            excerpt = "\n...\n".join(p for p in pieces if p)[:SNIPPET_CHARS]
+            block = f"[{idx}] {row.title or '(untitled)'}\nURL: {row.url}\n{excerpt}"
+            if used + len(block) > cap:
+                continue
+            chunks.append(block)
+            used += len(block)
+        return "\n\n".join(chunks) if chunks else "(evidence omitted by cap)"
+
+    def ref(self, idx: int) -> tuple[CitationRef | None, int]:
+        if idx < 1 or idx > len(self.rows):
+            return None, 0
+        row = self.rows[idx - 1]
+        spans = row.spans or [(0, min(len(row.text), SNIPPET_CHARS))]
+        grown: list[tuple[int, int]] = []
+        for a, b in spans[:3]:
+            a = max(0, int(a)); b = min(len(row.text), int(b))
+            if b <= a:
+                continue
+            need = max(CITE_TARGET, b - a)
+            pad = max(0, need - (b - a))
+            left = min(a, pad // 2)
+            right = min(len(row.text) - b, pad - left)
+            grown.append((a - left, b + right))
+        if not grown:
+            return None, 0
+        merged: list[tuple[int, int]] = []
+        for a, b in sorted(grown):
+            if merged and a <= merged[-1][1] + 64:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], b))
+            else:
+                merged.append((a, b))
+        cost = sum(b - a for a, b in merged)
+        return CitationRef(receipt_id=row.receipt_id, result_id=row.result_id, slices=[CitationSlice(start=a, end=b) for a, b in merged]), cost
+
+
+def _best_spans(text: str, focus: str, width: int = SNIPPET_CHARS, count: int = 2) -> list[tuple[int, int]]:
+    if len(text) <= width:
+        return [(0, len(text))] if text else []
+    terms = _terms(focus, 40)
     step = max(700, width // 3)
-    scored: list[tuple[int, int]] = []
-    start = 0
-    low = text.lower()
-    while start < n:
-        end = min(n, start + width)
-        block = low[start:end]
-        hits = 0
-        for token in wanted:
-            if token in block:
-                hits += 1
-        # Prefer actual data-bearing regions when semantic scores tie.
-        numeric = len(re.findall(r"\d", block[:1800]))
-        tableish = block.count("|") + block.count("\n")
-        bonus = min(6, numeric // 8) + min(4, tableish // 20)
-        scored.append((hits * 20 + bonus, start))
-        if end >= n:
+    scored = []
+    for start in range(0, len(text), step):
+        end = min(len(text), start + width)
+        seg = text[start:end]
+        numeric = min(5, len(re.findall(r"\d", seg)) // 15)
+        scored.append((_score_text(seg, terms) * 10 + numeric, start, end))
+        if end == len(text):
             break
-        start += step
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    chosen: list[tuple[int, int]] = []
-    for score, start in scored:
-        end = min(n, start + width)
-        if chosen and score <= 0:
+    scored.sort(key=lambda x: (-x[0], x[1]))
+    chosen: list[tuple[int, int]] = [(0, min(1200, len(text)))]
+    for score, start, end in scored:
+        if score <= 0 and len(chosen) > 1:
             continue
-        overlaps = False
-        for a, b in chosen:
-            if start < b and a < end:
-                overlaps = True
-                break
-        if overlaps:
+        if any(start < b and a < end for a, b in chosen):
             continue
         chosen.append((start, end))
-        if len(chosen) >= count:
+        if len(chosen) >= count + 1:
             break
-    chosen.sort()
-    if not chosen:
-        chosen = [(0, min(n, width))]
-    return chosen
-
-
-class QuestionShape:
-    def __init__(self, question: str) -> None:
-        self.question = question
-        self.numbered_parts = self._count_numbered_parts(question)
-        self.output_only = bool(re.search(
-            r"\b(?:output|respond|reply|answer) (?:with )?only\b"
-            r"|\bonly the exact\b|\bnothing else\b|\bno explanation\b"
-            r"|\bwithout explanation\b|\bjust the (?:name|names|value|values|"
-            r"number|numbers|list|text|title|titles|answer)\b",
-            question, re.I))
-        self.set_like = bool(re.search(
-            r"\b(?:list|name|identify|enumerate)\b.{0,60}\b(?:all|every|each)\b"
-            r"|\bwhich (?:[A-Za-z-]+\s+){0,3}[A-Za-z-]+s\b"
-            r"|\bhow many\b", question, re.I))
-        self.superlative = bool(re.search(
-            r"\b(?:highest|lowest|largest|smallest|most|least|greatest|fewest|"
-            r"oldest|youngest|newest|first|last|best|worst|only)\b", question, re.I))
-        self.strict_source = bool(re.search(
-            r"\busing only\b|\buse only\b|\bonly the official\b"
-            r"|\bsolely (?:from|using)\b|\bbased only on\b", question, re.I))
-        self.has_year = bool(re.search(r"\b(?:19|20)\d{2}\b", question))
-        self.complex = (
-            self.numbered_parts >= 2
-            or self.set_like
-            or self.superlative
-            or self.strict_source
-        )
-
-    @staticmethod
-    def _count_numbered_parts(question: str) -> int:
-        found: list[int] = []
-        for m in re.finditer(r"(?:^|[\s;])\((\d{1,2})\)", question):
-            value = int(m.group(1))
-            if value not in found:
-                found.append(value)
-        if len(found) >= 2:
-            return max(found)
-        found = []
-        for m in re.finditer(r"(?:^|\n)\s*(\d{1,2})[.)]\s+", question):
-            value = int(m.group(1))
-            if value not in found:
-                found.append(value)
-        return max(found) if len(found) >= 2 else 0
-
-    def hint(self) -> str:
-        notes: list[str] = []
-        if self.numbered_parts:
-            notes.append(
-                f"The question has {self.numbered_parts} explicit parts. "
-                "The final answer must substantively answer every part in order."
-            )
-        if self.set_like:
-            notes.append(
-                "This is a set/roster problem: establish the complete candidate pool "
-                "from a list/table before filtering members."
-            )
-        if self.superlative:
-            notes.append(
-                "This contains a tally/superlative: compare the complete relevant pool "
-                "before naming a winner or count."
-            )
-        if self.strict_source:
-            notes.append(
-                "The prompt imposes an exclusive source constraint. Third-party pages "
-                "may help discovery, but final factual claims must be supported by the "
-                "named/official source itself."
-            )
-        if self.has_year:
-            notes.append(
-                "Preserve the exact period/year scope. Do not silently substitute an "
-                "adjacent year, edition, quarter, or broader period."
-            )
-        return "\n".join(notes)
-
-
-class ToolPacket:
-    def __init__(self, text: str, rows: list[dict[str, Any]] | None = None) -> None:
-        self.text = text
-        self.rows = rows or []
-
-
-class EvidenceVault:
-    def __init__(self, question: str) -> None:
-        self.question = question
-        self.rows: list[dict[str, Any]] = []
-        self.searched: list[str] = []
-        self.fetched: list[str] = []
-
-    def add_packet(self, packet: ToolPacket) -> str:
-        body = packet.text
-        for index, row in enumerate(packet.rows):
-            self.rows.append(row)
-            number = len(self.rows)
-            body = body.replace(f"<ROW{index}>", f"[{number}]")
-        return body
-
-    def row(self, number: int) -> dict[str, Any] | None:
-        if 1 <= number <= len(self.rows):
-            return self.rows[number - 1]
-        return None
-
-    def mark_shown(self, number: int, start: int, end: int) -> None:
-        row = self.row(number)
-        if row is None:
-            return
-        text = row.get("text") or ""
-        if not text:
-            return
-        a = max(0, min(int(start), len(text)))
-        b = max(a, min(int(end), len(text)))
-        if b <= a:
-            return
-        shown = row.setdefault("shown", [])
-        shown.append((a, b))
-        row["shown"] = _merge_ranges(shown, len(text))
-
-    def keep_quote(self, number: int, quote: str) -> str:
-        row = self.row(number)
-        if row is None:
-            return f"# keep: source [{number}] does not exist"
-        text = row.get("text") or ""
-        q = (quote or "").strip()
-        if len(q) < MIN_QUOTE:
-            return "# keep: quote is too short"
-        pos = text.find(q)
-        if pos < 0:
-            pos = text.lower().find(q.lower())
-        if pos < 0:
-            return f"# keep: quote not found verbatim in [{number}]"
-        kept = row.setdefault("kept", [])
-        if len(kept) >= MAX_KEPT_PER_ROW:
-            return f"# keep: [{number}] already has enough retained evidence"
-        a = max(0, pos - KEEP_MARGIN)
-        b = min(len(text), pos + len(q) + KEEP_MARGIN)
-        kept.append((a, b))
-        row["kept"] = _merge_ranges(kept, len(text))
-        return f"# keep: retained decisive evidence from [{number}]"
-
-    def local_grep(self, number: int, pattern: str) -> str:
-        row = self.row(number)
-        if row is None:
-            return f"# grep: source [{number}] does not exist"
-        text = row.get("text") or ""
-        needle = (pattern or "").strip()
-        if not needle:
-            return "# grep: empty pattern"
-        try:
-            rx = re.compile(needle, re.I)
-        except re.error:
-            rx = re.compile(re.escape(needle), re.I)
-        blocks: list[str] = []
-        centers: list[int] = []
-        for match in rx.finditer(text):
-            center = (match.start() + match.end()) // 2
-            too_near = False
-            for old in centers:
-                if abs(center - old) < LOCAL_WINDOW // 2:
-                    too_near = True
-                    break
-            if too_near:
-                continue
-            centers.append(center)
-            a = max(0, center - LOCAL_WINDOW // 2)
-            b = min(len(text), a + LOCAL_WINDOW)
-            self.mark_shown(number, a, b)
-            blocks.append(f"\n--- [{number}] match @{a} ---\n{text[a:b]}")
-            if len(blocks) >= LOCAL_HITS:
-                break
-        if not blocks:
-            return f"# grep: no match for {needle!r} in [{number}]"
-        return f"# grep: {len(blocks)} match(es) in [{number}]" + "".join(blocks)
-
-    def local_read(self, number: int, offset: int, length: int) -> str:
-        row = self.row(number)
-        if row is None:
-            return f"# read: source [{number}] does not exist"
-        text = row.get("text") or ""
-        if not text:
-            return f"# read: source [{number}] has no stored text"
-        a = max(0, min(int(offset), max(0, len(text) - 1)))
-        amount = max(1, min(int(length), LOCAL_READ_CAP))
-        b = min(len(text), a + amount)
-        self.mark_shown(number, a, b)
-        return f"# read: [{number}] chars {a}:{b} of {len(text)}\n{text[a:b]}"
-
-    def _row_excerpt(self, row: dict[str, Any], cap: int) -> str:
-        text = row.get("text") or ""
-        if not text:
-            return ""
-        spans = row.get("kept") or row.get("shown") or []
-        pieces: list[str] = []
-        used = 0
-        for a, b in spans:
-            piece = text[int(a):int(b)].strip()
-            if not piece:
-                continue
-            room = cap - used
-            if room <= 0:
-                break
-            piece = piece[:room]
-            pieces.append(piece)
-            used += len(piece)
-        if not pieces:
-            return text[:cap]
-        return "\n...\n".join(pieces)
-
-    def digest(self, cap: int = DIGEST_CHARS) -> str:
-        if not self.rows:
-            return "(No citable evidence has been gathered yet.)"
-        query_terms = _terms(self.question, 30)
-        indexed: list[tuple[int, int, dict[str, Any]]] = []
-        for number, row in enumerate(self.rows, start=1):
-            title = row.get("title") or ""
-            url = row.get("url") or ""
-            preview = row.get("preview") or ""
-            kept_bonus = 30 if row.get("kept") else 0
-            fetched_bonus = 8 if row.get("kind") == "fetch" else 0
-            official_bonus = 6 if any(
-                key in _host(url)
-                for key in ("gov", "who.int", "worldathletics", "sec.gov", "census")
-            ) else 0
-            score = (
-                _overlap_score(title + " " + url + " " + preview, query_terms) * 5
-                + kept_bonus + fetched_bonus + official_bonus
-            )
-            indexed.append((score, number, row))
-        indexed.sort(key=lambda item: (-item[0], item[1]))
-
-        blocks: list[str] = []
-        spent = 0
-        for _, number, row in indexed:
-            excerpt = self._row_excerpt(row, ROW_DIGEST_CAP)
-            if not excerpt.strip():
-                continue
-            block = (
-                f"[{number}] {row.get('title') or '(untitled)'}\n"
-                f"URL: {row.get('url') or ''}\n"
-                f"{excerpt}"
-            )
-            if spent + len(block) > cap:
-                continue
-            blocks.append(block)
-            spent += len(block)
-        return "\n\n".join(blocks) if blocks else "(Evidence exists but could not be rendered.)"
-
-    def citation(self, number: int) -> tuple[CitationRef | None, int]:
-        row = self.row(number)
-        if row is None:
-            return None, 0
-        receipt = row.get("receipt_id") or ""
-        result = row.get("result_id") or ""
-        text = row.get("text") or ""
-        if not receipt or not result or not text:
-            return None, 0
-
-        spans = row.get("kept") or row.get("shown") or []
-        if not spans:
-            return None, 0
-        merged = _merge_ranges(spans, len(text))
-        if not merged:
-            return None, 0
-
-        # Give each cited fact useful surrounding context without flooding the judge.
-        grown: list[tuple[int, int]] = []
-        for a, b in merged[:4]:
-            length = b - a
-            want = min(CITATION_ROW_CAP, max(CITATION_TARGET, length))
-            extra = max(0, want - length)
-            left = min(a, extra // 2)
-            right = min(len(text) - b, extra - left)
-            a2 = a - left
-            b2 = b + right
-            if b2 - a2 < want:
-                a2 = max(0, a2 - (want - (b2 - a2)))
-            grown.append((a2, b2))
-        grown = _merge_ranges(grown, len(text))
-        cost = sum(b - a for a, b in grown)
-        slices = [CitationSlice(start=a, end=b) for a, b in grown]
-        if not slices:
-            return None, 0
-        return CitationRef(receipt_id=receipt, result_id=result, slices=slices), cost
-
-
-def _llm_text(payload: Any) -> str:
-    if payload is None:
-        return ""
-    llm = getattr(payload, "llm", None)
-    if llm is not None:
-        raw = getattr(llm, "raw_text", None)
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip()
-        choices = getattr(llm, "choices", None) or []
-        if choices:
-            msg = getattr(choices[0], "message", None)
-            content = getattr(msg, "content", None)
-            if isinstance(content, str) and content.strip():
-                return content.strip()
-    raw = getattr(payload, "raw_text", None)
-    if isinstance(raw, str) and raw.strip():
-        return raw.strip()
-    response = getattr(payload, "response", None)
-    if isinstance(response, dict):
-        for key in ("text", "content", "raw_text"):
-            item = response.get(key)
-            if isinstance(item, str) and item.strip():
-                return item.strip()
-    return ""
+    return sorted(chosen)
 
 
 async def _load_models() -> None:
     try:
         info = await tooling_info(timeout=8.0)
-        _remember_budget(info)
-        response = getattr(info, "response", None)
-        if not isinstance(response, dict):
-            return
-        providers = response.get("allowed_llm_provider_models")
+        providers = getattr(info, "response", {}).get("allowed_llm_provider_models", {})
         if not isinstance(providers, dict):
             return
-        raw = providers.get(LLM_PROVIDER)
-        names: list[str] = []
-        if isinstance(raw, (list, tuple)):
+        found: dict[str, tuple[str, ...]] = {}
+        for provider in LLM_PROVIDERS:
+            raw = providers.get(provider) or []
+            names = []
             for item in raw:
-                name = ""
-                if isinstance(item, str):
-                    name = item.strip()
-                elif isinstance(item, dict):
-                    candidate = item.get("model") or item.get("id") or item.get("name")
-                    if isinstance(candidate, str):
-                        name = candidate.strip()
-                if name and name not in names:
-                    names.append(name)
-        if names:
-            _STATE["models"] = tuple(names)
+                name = item if isinstance(item, str) else item.get("model") or item.get("id") or item.get("name") if isinstance(item, dict) else ""
+                if isinstance(name, str) and name.strip() and name.strip() not in names:
+                    names.append(name.strip())
+            if names:
+                found[provider] = tuple(names)
+        if found:
+            STATE["models"] = found
     except Exception:
         return
 
 
-def _model_order(preferred: tuple[str, ...]) -> list[str]:
-    live = _STATE.get("models")
-    if isinstance(live, tuple) and live:
-        allowed = [x for x in live if isinstance(x, str) and x]
-        chosen = [x for x in preferred if x in allowed]
-        remainder = [x for x in allowed if x not in chosen]
-        # Prefer generally capable research/synthesis families over embedding-ish names.
-        def rank(name: str) -> tuple[int, str]:
-            low = name.lower()
-            if "deepseek-v3.2" in low:
-                return (0, low)
-            if "qwen3.6" in low:
-                return (1, low)
-            if "gemma-4-31b" in low:
-                return (2, low)
-            if "kimi" in low:
-                return (3, low)
-            if "glm" in low:
-                return (4, low)
-            return (9, low)
-        remainder.sort(key=rank)
-        return (chosen + remainder)[:5]
-    return list(preferred[:4])
+def _rank_model(name: str) -> tuple[int, str]:
+    low = name.lower()
+    if "glm-5.2" in low: return (0, low)
+    if "gpt-oss-120b" in low: return (1, low)
+    if "deepseek" in low and "v3.2" in low: return (2, low)
+    if "gemini-2.5" in low: return (3, low)
+    if "qwen" in low: return (4, low)
+    if "glm-5" in low: return (5, low)
+    return (9, low)
 
 
-async def _chat(preferred: tuple[str, ...], messages: list[dict[str, Any]],
-                deadline: float, max_tokens: int, timeout_cap: float,
-                temperature: float = 0.1) -> Any:
-    models = _model_order(preferred)
-    for index, model in enumerate(models):
-        remaining = _left(deadline)
-        if remaining <= MIN_RETURN_SECONDS + 4.0:
-            return None
-        cap = timeout_cap
-        if index == 1:
-            cap = min(cap, 20.0)
-        elif index >= 2:
-            cap = min(cap, 15.0)
-        timeout = min(cap, remaining - MIN_RETURN_SECONDS)
-        if timeout <= 5.0:
-            return None
+def _attempts() -> list[tuple[str, str]]:
+    found = STATE.get("models") if isinstance(STATE.get("models"), dict) else {}
+    pairs: list[tuple[str, str]] = []
+    for provider in LLM_PROVIDERS:
+        live = list(found.get(provider, ())) if isinstance(found, dict) else []
+        if live:
+            chosen = [m for m in PREFERRED_MODELS if m in live]
+            rest = sorted([m for m in live if m not in chosen], key=_rank_model)
+            models = (chosen + rest)[:5]
+        else:
+            models = list(PREFERRED_MODELS[:4])
+        for model in models:
+            pair = (provider, model)
+            if pair not in pairs:
+                pairs.append(pair)
+    return pairs[:8]
+
+
+async def _chat(messages: list[dict[str, Any]], deadline: float, max_tokens: int, timeout: float, temp: float = 0.05) -> str:
+    for i, (provider, model) in enumerate(_attempts()):
+        left = _left(deadline)
+        if left <= TAIL_S + 4:
+            return ""
+        cap = timeout if i == 0 else min(timeout, 22.0 if i == 1 else 16.0)
         try:
-            payload = await llm_chat(
-                provider=LLM_PROVIDER,
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-                timeout=timeout,
-            )
-            _remember_budget(payload)
-            if _llm_text(payload):
-                return payload
+            payload = await llm_chat(provider=provider, model=model, messages=messages,
+                                     temperature=temp, max_output_tokens=max_tokens,
+                                     timeout=min(cap, left - TAIL_S))
+            text = _payload_text(payload)
+            if text.strip():
+                return text.strip()
         except Exception:
             continue
+    return ""
+
+
+def _payload_text(payload: Any) -> str:
+    if payload is None:
+        return ""
+    for root in (getattr(payload, "llm", None), payload):
+        if root is None:
+            continue
+        raw = getattr(root, "raw_text", None)
+        if isinstance(raw, str) and raw.strip():
+            return raw
+        choices = getattr(root, "choices", None) or []
+        if choices:
+            msg = getattr(choices[0], "message", None)
+            content = getattr(msg, "content", None)
+            if isinstance(content, str) and content.strip():
+                return content
+    resp = getattr(payload, "response", None)
+    if isinstance(resp, dict):
+        for key in ("text", "content", "raw_text"):
+            if isinstance(resp.get(key), str) and resp[key].strip():
+                return resp[key]
+    return ""
+
+
+def _json_from(text: str) -> Any:
+    raw = re.sub(r"^```(?:json)?\s*|\s*```$", "", (text or "").strip(), flags=re.I)
+    try:
+        return json.loads(raw)
+    except Exception:
+        pass
+    a, b = raw.find("{"), raw.rfind("}")
+    if a >= 0 and b > a:
+        try:
+            return json.loads(raw[a:b + 1])
+        except Exception:
+            return None
     return None
 
 
-def _loosen_query(query: str) -> str:
-    text = re.sub(r"\bsite:\S+\s*", " ", query or "", flags=re.I)
-    text = text.replace('"', " ")
-    return _space(text)
+def _seed_queries(question: str) -> list[str]:
+    flags = _question_flags(question)
+    base = _clean(question)
+    terms = _terms(question, 14)
+    seeds = [base[:240], " ".join(terms[:10])]
+    if flags["source_limited"]:
+        seeds.append('"' + '" "'.join(terms[:5]) + '"')
+    if flags["set"] or flags["rank"]:
+        seeds.append("official table list " + " ".join(terms[:8]))
+        seeds.append("site:gov OR site:edu " + " ".join(terms[:8]))
+    out = []
+    for seed in seeds:
+        q = _clean(seed).strip(' "')
+        if q and q.lower() not in [x.lower() for x in out]:
+            out.append(q)
+    return out[:MAX_SEARCHES]
 
 
-async def _search_packet(query: str, advanced: bool = False) -> ToolPacket:
-    q = _space(query)
-    if not q:
-        return ToolPacket("# search: empty query")
-    attempts = [q]
-    loose = _loosen_query(q)
-    if loose and loose != q:
-        attempts.append(loose)
+async def _make_queries(question: str, deadline: float) -> list[str]:
+    prompt = (
+        "Return JSON {\"queries\":[...]} with 4-6 concise web searches for answering this hard factual question. "
+        "Include primary-source and candidate-roster searches when relevant. No explanation.\nQUESTION:\n" + question
+    )
+    text = await _chat([{"role": "user", "content": prompt}], deadline, 900, 18.0, 0.0)
+    obj = _json_from(text)
+    queries = []
+    if isinstance(obj, dict) and isinstance(obj.get("queries"), list):
+        queries = [str(x) for x in obj["queries"] if str(x).strip()]
+    merged = []
+    for q in queries + _seed_queries(question):
+        q = _clean(q)[:260]
+        if q and q.lower() not in [x.lower() for x in merged]:
+            merged.append(q)
+    return merged[:MAX_SEARCHES]
 
-    last_error = ""
-    for attempt_index, current in enumerate(attempts[:2]):
-        try:
-            payload = await search_web(
-                current,
-                provider=SEARCH_PROVIDER,
-                num=SEARCH_RESULTS,
-                timeout=SEARCH_TIMEOUT,
-                provider_extra={
-                    "mode": "advanced" if (advanced or attempt_index > 0) else "basic",
-                    "max_chars_total": 20000,
-                    "excerpt_settings": {"max_chars_per_result": 2800},
-                },
-            )
-        except Exception as exc:
-            last_error = str(exc)
-            continue
-        _remember_budget(payload)
+
+async def _search_one(query: str) -> list[Row]:
+    rows: list[Row] = []
+    try:
+        payload = await search_web(query, provider=SEARCH_PROVIDER, num=SEARCH_NUM, timeout=SEARCH_S,
+                                   provider_extra={"mode": "advanced", "max_chars_total": 20000,
+                                                   "excerpt_settings": {"max_chars_per_result": 2200}})
+        receipt = str(getattr(payload, "receipt_id", "") or "")
+        for item in list(getattr(payload, "results", None) or []):
+            rid = getattr(item, "result_id", None)
+            note = str(getattr(item, "note", "") or "")
+            if not receipt or not isinstance(rid, str) or not note.strip():
+                continue
+            rows.append(Row(receipt, rid, str(getattr(item, "title", "") or ""),
+                            str(getattr(item, "url", "") or ""), note, "search",
+                            [(0, min(len(note), 1800))]))
+    except Exception:
+        return []
+    return rows
+
+
+async def _fetch_one(row: Row, question: str) -> Row | None:
+    if not row.url.startswith(("http://", "https://")):
+        return None
+    try:
+        payload = await fetch_page(row.url, provider=SEARCH_PROVIDER, timeout=FETCH_S,
+                                   provider_extra={"objective": _clip("Find exact evidence for: " + question, 1400),
+                                                   "max_chars_total": 42000,
+                                                   "excerpt_settings": {"max_chars_per_result": 14000},
+                                                   "full_content": True})
         receipt = str(getattr(payload, "receipt_id", "") or "")
         results = list(getattr(payload, "results", None) or [])
         if not receipt or not results:
-            continue
-
-        rows: list[dict[str, Any]] = []
-        lines = [f"# search {current!r}: {len(results)} result(s)"]
-        for item in results:
-            rid = getattr(item, "result_id", None)
-            note = str(getattr(item, "note", None) or "")
-            if not isinstance(rid, str) or not rid or not note.strip():
-                continue
-            title = str(getattr(item, "title", None) or "")
-            url = str(getattr(item, "url", None) or "")
-            show_end = min(len(note), max(120, SEARCH_NOTE_SHOW))
-            rows.append({
-                "receipt_id": receipt,
-                "result_id": rid,
-                "title": title,
-                "url": url,
-                "text": note,
-                "preview": note[:SEARCH_NOTE_SHOW],
-                "kind": "search",
-                "shown": [(0, show_end)],
-                "kept": [],
-            })
-            marker = f"<ROW{len(rows) - 1}>"
-            lines.append(
-                f"{marker} {title} — {url}\n"
-                f"{note[:SEARCH_NOTE_SHOW]}"
-            )
-        if rows:
-            return ToolPacket("\n\n".join(lines), rows)
-    return ToolPacket(f"# search failed for {q!r}: {last_error[:180]}")
-
-
-async def _fetch_packet(url: str, focus: str, question: str) -> ToolPacket:
-    target = (url or "").strip()
-    if not target:
-        return ToolPacket("# fetch: empty url")
-    objective = (
-        "Extract the page text needed to answer the research question. Preserve exact "
-        "names, dates, figures, units, table rows, headings, qualifiers and source labels. "
-        f"Question: {_clip(question, 1400)}"
-    )
-    if focus.strip():
-        objective += f" Focus especially on: {_clip(focus, 700)}"
-    try:
-        payload = await fetch_page(
-            target,
-            provider=SEARCH_PROVIDER,
-            timeout=FETCH_TIMEOUT,
-            provider_extra={
-                "objective": objective,
-                "max_chars_total": 36000,
-                "excerpt_settings": {"max_chars_per_result": 12000},
-                "full_content": True,
-            },
-        )
-    except Exception as exc:
-        return ToolPacket(f"# fetch failed for {target!r}: {str(exc)[:180]}")
-    _remember_budget(payload)
-    receipt = str(getattr(payload, "receipt_id", "") or "")
-    results = list(getattr(payload, "results", None) or [])
-    if not receipt or not results:
-        return ToolPacket(f"# fetch returned no content for {target!r}")
-    item = results[0]
-    rid = getattr(item, "result_id", None)
-    note = str(getattr(item, "note", None) or "")
-    if not isinstance(rid, str) or not rid or not note.strip():
-        return ToolPacket(f"# fetch returned unusable content for {target!r}")
-    title = str(getattr(item, "title", None) or target)
-    final_url = str(getattr(item, "url", None) or target)
-
-    focus_text = question + " " + focus + " " + title
-    spans = _window_spans(note, focus_text)
-    if len(note) <= ROW_DIGEST_CAP:
-        shown = [(0, len(note))]
-    else:
-        shown = [(0, min(len(note), FETCH_ORIENTATION))]
-        for span in spans:
-            shown.append(span)
-        shown = _merge_ranges(shown, len(note))
-
-    row = {
-        "receipt_id": receipt,
-        "result_id": rid,
-        "title": title,
-        "url": final_url,
-        "text": note,
-        "preview": "",
-        "kind": "fetch",
-        "shown": shown,
-        "kept": [],
-    }
-    orientation = note[:FETCH_ORIENTATION]
-    chunks = []
-    for a, b in spans:
-        chunks.append(f"\n--- section @{a} ---\n{note[a:b]}")
-    rendered = (
-        f"# fetch {target!r} -> <ROW0> {len(note)} chars\n"
-        f"TITLE: {title}\nURL: {final_url}\n"
-        f"--- orientation ---\n{orientation}"
-        + "".join(chunks)
-    )
-    row["preview"] = _clip(" ".join(note[a:b] for a, b in spans), 1500)
-    return ToolPacket(rendered, [row])
-
-
-def _seed_queries(question: str, shape: QuestionShape) -> list[str]:
-    clean = _space(question)
-    salient = _terms(clean, 12)
-    seeds: list[str] = []
-    if clean:
-        seeds.append(_clip(clean, 240))
-    if salient:
-        seeds.append(" ".join(salient[:9]))
-    if (shape.set_like or shape.superlative) and salient:
-        seeds.append("official list table " + " ".join(salient[:7]))
-    out: list[str] = []
-    for item in seeds:
-        q = _space(item)
-        if q and q.lower() not in [x.lower() for x in out]:
-            out.append(q)
-    return out[:3]
-
-
-async def _preseed(question: str, shape: QuestionShape, vault: EvidenceVault,
-                   deadline: float) -> str:
-    seeds = _seed_queries(question, shape)
-    if not seeds or _left(deadline) < 35.0:
-        return ""
-    tasks = [asyncio.ensure_future(_search_packet(q, advanced=False)) for q in seeds]
-    done, pending = await asyncio.wait(tasks, timeout=min(TOOL_PHASE_TIMEOUT, max(5.0, _left(deadline) - 8.0)))
-    blocks: list[str] = []
-    for task in tasks:
-        if task.done():
-            try:
-                packet = task.result()
-            except Exception:
-                packet = ToolPacket("# seed search crashed")
-            blocks.append(vault.add_packet(packet))
-        else:
-            task.cancel()
-            blocks.append("# seed search timed out")
-    return "\n\n".join(blocks)
-
-
-ACTION_RULES = """
-You are the research director inside a bounded evidence agent. Your goal is to
-beat a strong reference answer on correctness, completeness, source quality,
-exact values, and citation support.
-
-EVIDENCE RULES
-- Use numbered evidence [n]. Never invent a citation number.
-- Prefer the source that originates a fact: official database, regulator,
-  organization, filing, paper, or primary document. An aggregator is useful for
-  discovery, but primary evidence wins.
-- If the question says "using only", "solely", or otherwise restricts the
-  source, final factual claims must be backed by that named source.
-- Copy names, labels, figures, capitalization, units, dates, and status codes
-  exactly from the requested source when the question cares about that source.
-- When a displayed source contains the decisive text, use a KEEP action with an
-  exact verbatim quote. KEEP makes the eventual citation point at the proof
-  rather than page furniture.
-- If a fetched page is long and the needed datum is not visible, use GREP and
-  READ on the already-fetched source instead of searching for the same page again.
-
-COMPLETENESS RULES
-- Answer every distinct sub-question.
-- For a set/filter question, establish the complete candidate roster before
-  deciding who qualifies; verify each relevant member against every condition.
-- For a count/rank/superlative, inspect the complete relevant pool/table before
-  computing the result.
-- For multi-period or multi-stage questions, bind each fact to the correct
-  period/stage/source. Never let a semifinal, prior year, sibling product, or
-  neighboring metric answer a final/current/target slot.
-- Explain a discrepancy when the question explicitly asks for a comparison and
-  the evidence establishes why the values differ.
-- If sources conflict, resolve the conflict before finalizing; do not print two
-  incompatible values for the same requested fact.
-
-ANSWER RULES
-- The first words should answer the question, not narrate your research.
-- Every load-bearing factual sentence should carry [n] immediately after the
-  claim it supports.
-- Obey literal output requirements (ordering, exact text, count, units, etc.).
-- Do not return planning notes, tool syntax, refusals, or "insufficient evidence"
-  prose when you have useful evidence.
-
-ACTION PROTOCOL
-Return ONE JSON object, with no markdown fences.
-
-To research:
-{"actions":[
-  {"type":"search","query":"concise query"},
-  {"type":"fetch","url":"https://...","focus":"section/table/entity"},
-  {"type":"grep","source":3,"pattern":"literal or regex"},
-  {"type":"read","source":3,"offset":12000,"length":5000},
-  {"type":"keep","source":3,"quote":"exact verbatim source text"}
-]}
-
-You may request up to six independent actions at once. GREP/READ/KEEP may only
-refer to source numbers that already exist before this turn.
-
-When the evidence is sufficient:
-{"final":"complete cited answer"}
-
-Do not mix actions and final in the same object.
-""".strip()
-
-
-COMMIT_RULES = """
-Write the final answer to the user's research question using ONLY the numbered
-evidence below for precise factual claims.
-
-Start directly with the requested answer. Answer every requested part. Preserve
-exact source strings for source-sensitive names/labels/figures. Use [n] after
-each factual sentence so it points to evidence that actually states the claim.
-For sets, counts, comparisons, and superlatives, show enough of the pool or
-arithmetic to make completeness checkable, but stay concise. Never mention the
-research process, uncertainty markers, or missing tools. Do not emit JSON or
-tool syntax. If the question explicitly requires only a bare answer, put that
-bare answer on the first line; evidence markers may appear in supporting lines
-that the controller can remove after citations are harvested.
-""".strip()
-
-
-CRITIC_RULES = """
-You are the final pairwise-score critic. Improve the answer only when necessary.
-Check: every requested part answered, correct entity kind, exact period/stage,
-strict named-source compliance, exact source values, no contradictory values,
-complete pool for set/superlative/count questions, and citations on every
-load-bearing claim. Never introduce a factual value not present in the numbered
-evidence. Return only the improved final answer; if already strong, return it
-unchanged.
-""".strip()
-
-
-def _strip_fence(text: str) -> str:
-    value = (text or "").strip()
-    value = re.sub(r"^```(?:json)?\s*", "", value, flags=re.I)
-    value = re.sub(r"\s*```$", "", value)
-    return value.strip()
-
-
-def _turn_object(text: str) -> dict[str, Any] | None:
-    raw = _strip_fence(text)
-    try:
-        value = json.loads(raw)
-        if isinstance(value, dict):
-            return value
-    except Exception:
-        pass
-    first = raw.find("{")
-    last = raw.rfind("}")
-    if first >= 0 and last > first:
-        try:
-            value = json.loads(raw[first:last + 1])
-            if isinstance(value, dict):
-                return value
-        except Exception:
             return None
-    return None
-
-
-def _normalize_action(item: Any) -> dict[str, Any] | None:
-    if not isinstance(item, dict):
-        return None
-    kind = item.get("type") or item.get("tool") or item.get("name")
-    if not isinstance(kind, str):
-        return None
-    action = dict(item)
-    action["type"] = kind.lower().strip()
-    return action
-
-
-async def _run_action(action: dict[str, Any], question: str,
-                      vault: EvidenceVault) -> ToolPacket:
-    kind = str(action.get("type") or "").lower()
-    if kind == "search":
-        return await _search_packet(str(action.get("query") or ""), advanced=False)
-    if kind == "fetch":
-        return await _fetch_packet(
-            str(action.get("url") or ""),
-            str(action.get("focus") or ""),
-            question,
-        )
-    if kind == "grep":
-        try:
-            source = int(action.get("source") or 0)
-        except Exception:
-            source = 0
-        return ToolPacket(vault.local_grep(source, str(action.get("pattern") or "")))
-    if kind == "read":
-        try:
-            source = int(action.get("source") or 0)
-        except Exception:
-            source = 0
-        try:
-            offset = int(action.get("offset") or 0)
-        except Exception:
-            offset = 0
-        try:
-            length = int(action.get("length") or 4000)
-        except Exception:
-            length = 4000
-        return ToolPacket(vault.local_read(source, offset, length))
-    if kind == "keep":
-        try:
-            source = int(action.get("source") or 0)
-        except Exception:
-            source = 0
-        return ToolPacket(vault.keep_quote(source, str(action.get("quote") or "")))
-    return ToolPacket(f"# unknown action {kind!r}")
-
-
-async def _execute_actions(actions: list[dict[str, Any]], question: str,
-                           vault: EvidenceVault, deadline: float) -> str:
-    chosen = actions[:MAX_ACTIONS_PER_TURN]
-    if not chosen:
-        return "# no valid actions"
-    tasks = [asyncio.ensure_future(_run_action(action, question, vault)) for action in chosen]
-    budget = min(TOOL_PHASE_TIMEOUT, max(5.0, _left(deadline) - MIN_RETURN_SECONDS))
-    try:
-        await asyncio.wait(tasks, timeout=budget)
+        item = results[0]
+        rid = getattr(item, "result_id", None)
+        note = str(getattr(item, "note", "") or "")
+        if not isinstance(rid, str) or not note.strip():
+            return None
+        title = str(getattr(item, "title", "") or row.title)
+        url = str(getattr(item, "url", "") or row.url)
+        return Row(receipt, rid, title, url, note, "fetch", _best_spans(note, question + " " + title))
     except Exception:
-        pass
-    blocks: list[str] = []
-    # Commit in requested action order, never network-completion order.
-    for task in tasks:
-        if task.done():
-            try:
-                packet = task.result()
-            except Exception as exc:
-                packet = ToolPacket(f"# action crashed: {str(exc)[:180]}")
-            blocks.append(vault.add_packet(packet))
-        else:
+        return None
+
+
+async def _gather(question: str, nb: Notebook, deadline: float) -> None:
+    queries = await _make_queries(question, deadline)
+    tasks = [asyncio.create_task(_search_one(q)) for q in queries]
+    done, pending = await asyncio.wait(tasks, timeout=min(24.0, max(5.0, _left(deadline) - 120)))
+    candidates: list[Row] = []
+    terms = _terms(question)
+    for task in done:
+        for row in task.result() if not task.exception() else []:
+            nb.add(row)
+            candidates.append(row)
+    for task in pending:
+        task.cancel()
+    candidates.sort(key=lambda r: (_score_text(r.title + " " + r.url + " " + r.text[:1200], terms),
+                                   any(x in _host(r.url) for x in ("gov", "edu", "int", "sec.gov"))), reverse=True)
+    fetches = []
+    for row in candidates:
+        if len(fetches) >= MAX_FETCHES or _left(deadline) < 95:
+            break
+        if row.url.startswith(("http://", "https://")):
+            fetches.append(asyncio.create_task(_fetch_one(row, question)))
+    if fetches:
+        done, pending = await asyncio.wait(fetches, timeout=min(34.0, max(5.0, _left(deadline) - 65)))
+        for task in done:
+            if not task.exception():
+                got = task.result()
+                if got:
+                    nb.add(got)
+        for task in pending:
             task.cancel()
-            blocks.append("# action timed out; continue with existing evidence")
-    return "\n\n".join(blocks)
 
 
-_BRACKET_MAP = {
-    0x3010: "[", 0x3011: "]", 0xFF3B: "[", 0xFF3D: "]",
-    0x2011: "-", 0x2212: "-",
-}
-for _digit in range(10):
-    _BRACKET_MAP[0xFF10 + _digit] = chr(48 + _digit)
+def _answer_prompt(question: str, nb: Notebook, repair: str = "") -> list[dict[str, Any]]:
+    flags = _question_flags(question)
+    system = (
+        "You answer difficult factual questions for a pairwise judge. Use only numbered evidence. "
+        "Every factual claim needs an immediate [n] citation. Prefer exact source wording, dates, units, and names. "
+        "For set/rank/count questions, show the checked pool or arithmetic enough to prove completeness. "
+        "Do not mention research limitations; answer directly."
+    )
+    user = f"QUESTION:\n{question}\n\nFLAGS: {flags}\n\nEVIDENCE:\n{nb.render()}\n\n"
+    if repair:
+        user += f"REPAIR INSTRUCTIONS:\n{repair}\n\n"
+    user += "Write the final answer now."
+    return [{"role": "system", "content": system}, {"role": "user", "content": user}]
 
 
-def _normalize_markers(text: str) -> str:
-    return (text or "").translate(_BRACKET_MAP)
-
-
-_CITE_RE = re.compile(r"\[([0-9][0-9,\s-]*)\]")
-
-
-def _marker_numbers(text: str, top: int) -> list[int]:
-    normalized = _normalize_markers(text)
-    out: list[int] = []
-    seen: set[int] = set()
-    for match in _CITE_RE.finditer(normalized):
-        for chunk in match.group(1).split(","):
-            part = chunk.strip()
-            range_match = re.fullmatch(r"(\d{1,4})\s*-\s*(\d{1,4})", part)
-            if range_match:
-                low = int(range_match.group(1))
-                high = int(range_match.group(2))
-                high = min(high, low + 20)
-                for number in range(low, high + 1):
-                    if 1 <= number <= top and number not in seen:
-                        seen.add(number)
-                        out.append(number)
+def _markers(text: str, top: int) -> list[int]:
+    seen: set[int] = set(); out: list[int] = []
+    for m in _CITE.finditer(text or ""):
+        for part in m.group(1).split(','):
+            part = part.strip()
+            rm = re.fullmatch(r"(\d+)\s*-\s*(\d+)", part)
+            if rm:
+                lo, hi = int(rm.group(1)), min(int(rm.group(2)), int(rm.group(1)) + 20)
+                nums = range(lo, hi + 1)
             elif part.isdigit():
-                number = int(part)
-                if 1 <= number <= top and number not in seen:
-                    seen.add(number)
-                    out.append(number)
+                nums = [int(part)]
+            else:
+                nums = []
+            for n in nums:
+                if 1 <= n <= top and n not in seen:
+                    seen.add(n); out.append(n)
     return out
 
 
-_TOOLISH_RE = re.compile(
-    r"<\s*/?\s*tool|^\s*\{\s*\"actions\"\s*:|\b(?:search|fetch|grep|read|keep)\s*\(",
-    re.I,
-)
-_REFUSAL_RE = re.compile(
-    r"^\s*(?:i (?:cannot|can't|am unable)|unable to|sorry[,.:]|"
-    r"best-effort answer unavailable|no supported answer)",
-    re.I,
-)
+def _bad_numbers(answer: str, nb: Notebook) -> list[str]:
+    bad: list[str] = []
+    for sent in re.split(r"(?<=[.!?])\s+|\n+", answer or ""):
+        cited = _markers(sent, len(nb.rows))
+        if not cited:
+            continue
+        src = " ".join(nb.rows[i - 1].text for i in cited)
+        plain = src.replace(',', '')
+        for m in _NUM.finditer(_CITE.sub(' ', sent)):
+            tok = m.group(0)
+            if len(re.sub(r"\D", "", tok)) < 2:
+                continue
+            if tok not in src and tok.replace(',', '') not in plain and tok not in bad:
+                bad.append(tok)
+    return bad[:8]
 
 
-def _usable_answer(text: str) -> bool:
-    value = _normalize_markers(text).strip()
-    if not value:
-        return False
-    if _TOOLISH_RE.search(value) or _REFUSAL_RE.match(value):
-        return False
+def _usable(text: str) -> bool:
+    value = (text or "").strip()
     if len(value) < 8:
+        return False
+    if re.search(r"^\s*(?:unable to|i cannot|sorry|no evidence)|\{\s*\"queries\"", value, re.I):
         return False
     return True
 
 
-def _has_citation(text: str) -> bool:
-    return bool(re.search(r"\[[0-9]{1,4}\]", _normalize_markers(text or "")))
+async def _repair(question: str, answer: str, nb: Notebook, deadline: float) -> str:
+    if _left(deadline) < 36 or not _usable(answer):
+        return answer
+    issues = []
+    if not _markers(answer, len(nb.rows)):
+        issues.append("The answer has no usable citations; add [n] citations from evidence.")
+    nums = _bad_numbers(answer, nb)
+    if nums:
+        issues.append("These cited numbers are not present in cited source text: " + ", ".join(nums) + ".")
+    flags = _question_flags(question)
+    if flags["set"] or flags["rank"]:
+        issues.append("Verify completeness for any set/rank/count and cite the pool or table used.")
+    if not issues:
+        return answer
+    fixed = await _chat(_answer_prompt(question, nb, "\n".join(issues) + " Return a complete corrected answer."),
+                        deadline, 3600, REPAIR_S, 0.0)
+    return fixed if _usable(fixed) and len(fixed) > max(12, len(answer) // 3) else answer
 
 
-_NUM_RE = re.compile(r"(?<!\[)\b\d[\d,]*(?:\.\d+)?%?\b")
-
-
-def _unsupported_numbers(answer: str, vault: EvidenceVault) -> list[str]:
-    flagged: list[str] = []
-    for sentence in re.split(r"(?<=[.!?])\s+|\n+", _normalize_markers(answer or "")):
-        if not sentence.strip():
-            continue
-        cited = _marker_numbers(sentence, len(vault.rows))
-        if not cited:
-            continue
-        source_text = " ".join(
-            (vault.row(number) or {}).get("text") or ""
-            for number in cited
-        )
-        plain_source = source_text.replace(",", "")
-        for match in _NUM_RE.finditer(_CITE_RE.sub(" ", sentence)):
-            token = match.group(0)
-            digits = re.sub(r"\D", "", token)
-            if len(digits) < 2:
-                continue
-            if token not in source_text and token.replace(",", "") not in plain_source:
-                if token not in flagged:
-                    flagged.append(token)
-    return flagged[:6]
-
-
-def _answer_part_signal(answer: str, shape: QuestionShape) -> bool:
-    if shape.numbered_parts <= 1:
-        return True
-    text = _normalize_markers(answer or "")
-    explicit = 0
-    for number in range(1, shape.numbered_parts + 1):
-        if re.search(rf"(?:^|\n|\s)\({number}\)", text):
-            explicit += 1
-    if explicit == shape.numbered_parts:
-        return True
-    # Do not reject good unnumbered prose solely for formatting; require enough
-    # substantive sentence/line units to plausibly cover all parts.
-    units = [x for x in re.split(r"(?<=[.!?])\s+|\n+", text) if len(x.strip()) > 18]
-    return len(units) >= shape.numbered_parts
-
-
-def _citations(answer: str, vault: EvidenceVault) -> list[CitationRef]:
+def _citations(answer: str, nb: Notebook) -> list[CitationRef]:
     refs: list[CitationRef] = []
     spent = 0
-    for number in _marker_numbers(answer, len(vault.rows)):
-        if len(refs) >= MAX_CITATIONS:
+    for idx in _markers(answer, len(nb.rows)):
+        if len(refs) >= MAX_CITES:
             break
-        ref, cost = vault.citation(number)
-        if ref is None:
+        ref, cost = nb.ref(idx)
+        if ref is None or spent + cost > MAX_CITE_TOTAL:
             continue
-        if spent + cost > TOTAL_EVIDENCE_CAP:
-            continue
-        refs.append(ref)
-        spent += cost
+        refs.append(ref); spent += cost
     return refs
 
 
-def _output_only_line(answer: str, question: str) -> str:
-    shape = QuestionShape(question)
-    if not shape.output_only:
+def _bare(answer: str, question: str) -> str:
+    if not _question_flags(question)["bare"]:
         return answer
-    for raw in (answer or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
-        if line.startswith(("#", ">", "Proof:", "Evidence:")):
-            continue
-        # Remove citation markers from the literal output line.
-        line = _CITE_RE.sub("", _normalize_markers(line)).strip()
-        line = line.strip("*_` ")
-        if line:
+    for line in (answer or "").splitlines():
+        line = _CITE.sub("", line).strip(" -*\t")
+        if line and not re.match(r"^(proof|evidence|citation)s?:", line, re.I):
             return line
-    return _CITE_RE.sub("", _normalize_markers(answer or "")).strip()
-
-
-def _research_prompt(question: str, shape: QuestionShape, vault: EvidenceVault,
-                     recent: str, provisional: str, left: float) -> list[dict[str, Any]]:
-    extra = shape.hint()
-    state = vault.digest()
-    user = (
-        f"QUESTION:\n{question}\n\n"
-        f"QUESTION-SHAPE REQUIREMENTS:\n{extra or '(ordinary factual research question)'}\n\n"
-        f"NUMBERED EVIDENCE CURRENTLY AVAILABLE:\n{state}\n\n"
-    )
-    if recent.strip():
-        user += f"RESULTS OF THE MOST RECENT ACTIONS:\n{_clip(recent, 18000)}\n\n"
-    if provisional.strip():
-        user += (
-            "CURRENT PROVISIONAL ANSWER (repair it if research shows a problem):\n"
-            f"{_clip(provisional, 10000)}\n\n"
-        )
-    user += (
-        f"Approximately {int(max(0.0, left))} seconds remain. "
-        "Choose the highest-value next research actions, or finalize if every "
-        "load-bearing part is grounded."
-    )
-    return [
-        {"role": "system", "content": ACTION_RULES},
-        {"role": "user", "content": user},
-    ]
-
-
-async def _research_loop(question: str, shape: QuestionShape, vault: EvidenceVault,
-                         deadline: float, recent: str) -> str:
-    provisional = ""
-    for turn in range(MAX_RESEARCH_TURNS):
-        left = _left(deadline)
-        if left <= WRAPUP_SECONDS:
-            break
-        messages = _research_prompt(question, shape, vault, recent, provisional, left)
-        payload = await _chat(
-            PRIMARY_MODELS, messages, deadline,
-            max_tokens=2600, timeout_cap=TURN_TIMEOUT, temperature=0.1,
-        )
-        raw = _llm_text(payload)
-        if not raw:
-            break
-        obj = _turn_object(raw)
-        if obj is None:
-            if _usable_answer(raw):
-                provisional = raw
-                break
-            recent = "# model output was not valid action JSON; choose actions or final next turn"
-            continue
-
-        final = obj.get("final")
-        if isinstance(final, str) and _usable_answer(final):
-            provisional = final.strip()
-            # A cited, plausibly complete answer can commit early.
-            if _has_citation(provisional) and _answer_part_signal(provisional, shape):
-                unsupported = _unsupported_numbers(provisional, vault)
-                if not unsupported:
-                    break
-            recent = (
-                "# provisional answer needs one more grounding pass: "
-                "ensure all requested parts and precise values are backed by [n]"
-            )
-            continue
-
-        raw_actions = obj.get("actions")
-        actions: list[dict[str, Any]] = []
-        if isinstance(raw_actions, list):
-            for item in raw_actions:
-                action = _normalize_action(item)
-                if action is not None:
-                    actions.append(action)
-        if not actions:
-            recent = "# no valid actions were returned; finalize or choose concrete actions"
-            continue
-        recent = await _execute_actions(actions, question, vault, deadline)
-    return provisional
-
-
-async def _write_final(question: str, shape: QuestionShape, vault: EvidenceVault,
-                       provisional: str, deadline: float) -> str:
-    digest = vault.digest()
-    extra = shape.hint()
-    prompt = (
-        f"QUESTION:\n{question}\n\n"
-        f"QUESTION-SHAPE REQUIREMENTS:\n{extra or '(ordinary factual research question)'}\n\n"
-        f"NUMBERED EVIDENCE:\n{digest}\n\n"
-    )
-    if provisional.strip():
-        prompt += (
-            "A research-loop draft follows. Keep anything it got right, but correct "
-            "it wherever the evidence or question scope disagrees:\n"
-            f"{_clip(provisional, 12000)}\n\n"
-        )
-    prompt += "Write the final answer now."
-    payload = await _chat(
-        WRITER_MODELS,
-        [
-            {"role": "system", "content": COMMIT_RULES},
-            {"role": "user", "content": prompt},
-        ],
-        deadline,
-        max_tokens=4200,
-        timeout_cap=WRITER_TIMEOUT,
-        temperature=0.08,
-    )
-    answer = _llm_text(payload)
-    if _usable_answer(answer):
-        return answer
-    if _usable_answer(provisional):
-        return provisional
-    return ""
-
-
-async def _critic(question: str, shape: QuestionShape, vault: EvidenceVault,
-                  answer: str, deadline: float) -> str:
-    if not _usable_answer(answer) or _left(deadline) < 28.0:
-        return answer
-    if not shape.complex and not _unsupported_numbers(answer, vault):
-        return answer
-    evidence = vault.digest(cap=36000)
-    unsupported = _unsupported_numbers(answer, vault)
-    note = ""
-    if unsupported:
-        note = (
-            "\nThe deterministic checker found answer values not present in their "
-            "cited source text: " + ", ".join(unsupported) + ". Remove or correct them."
-        )
-    prompt = (
-        f"QUESTION:\n{question}\n\n"
-        f"CURRENT ANSWER:\n{_clip(answer, 14000)}\n\n"
-        f"NUMBERED EVIDENCE:\n{evidence}\n"
-        f"{note}\n\nReturn the corrected final answer."
-    )
-    payload = await _chat(
-        WRITER_MODELS,
-        [
-            {"role": "system", "content": CRITIC_RULES},
-            {"role": "user", "content": prompt},
-        ],
-        deadline,
-        max_tokens=3800,
-        timeout_cap=CRITIC_TIMEOUT,
-        temperature=0.0,
-    )
-    candidate = _llm_text(payload)
-    if not _usable_answer(candidate):
-        return answer
-    if len(candidate) < max(12, int(len(answer) * 0.45)):
-        return answer
-    # Do not adopt a critic answer that drops all citations while evidence exists.
-    if vault.rows and _has_citation(answer) and not _has_citation(candidate):
-        return answer
-    return candidate
-
-
-def _deterministic_partial(vault: EvidenceVault) -> str:
-    if not vault.rows:
-        return ""
-    lines: list[str] = []
-    query_terms = _terms(vault.question, 24)
-    ranked: list[tuple[int, int, dict[str, Any]]] = []
-    for number, row in enumerate(vault.rows, start=1):
-        content = (row.get("title") or "") + " " + (row.get("preview") or "")
-        score = _overlap_score(content, query_terms)
-        if row.get("kind") == "fetch":
-            score += 3
-        ranked.append((score, number, row))
-    ranked.sort(key=lambda item: (-item[0], item[1]))
-    for _, number, row in ranked[:6]:
-        preview = _space(row.get("preview") or "")
-        if len(preview) < 30:
-            preview = _space(vault._row_excerpt(row, 500))
-        if preview:
-            lines.append(f"{_clip(preview, 420)} [{number}]")
-    return "\n".join(lines)
+    return _CITE.sub("", answer or "").strip()
 
 
 def _schema_kind(schema: Any) -> str:
-    if not isinstance(schema, dict):
-        return ""
-    kind = schema.get("type")
-    if isinstance(kind, str):
-        return kind
-    if isinstance(kind, list):
-        for item in kind:
-            if isinstance(item, str) and item != "null":
-                return item
-    if isinstance(schema.get("properties"), dict):
-        return "object"
-    if isinstance(schema.get("items"), dict):
-        return "array"
+    if not isinstance(schema, dict): return ""
+    t = schema.get("type")
+    if isinstance(t, str): return t
+    if isinstance(t, list):
+        return next((x for x in t if isinstance(x, str) and x != "null"), "")
+    if isinstance(schema.get("properties"), dict): return "object"
+    if isinstance(schema.get("items"), dict): return "array"
     return ""
 
 
-def _shape_ok(value: Any, schema: Any) -> bool:
-    kind = _schema_kind(schema)
-    if not kind:
-        return True
-    if kind == "object":
-        return isinstance(value, dict)
-    if kind == "array":
-        return isinstance(value, list)
-    if kind == "string":
-        return isinstance(value, str)
-    if kind == "integer":
-        return isinstance(value, int) and not isinstance(value, bool)
-    if kind == "number":
-        return isinstance(value, (int, float)) and not isinstance(value, bool)
-    if kind == "boolean":
-        return isinstance(value, bool)
-    if kind == "null":
-        return value is None
-    return True
-
-
-async def _schema_convert(question: str, answer: str, schema: Any,
-                          deadline: float) -> Any:
-    if _left(deadline) < 12.0:
-        return None
-    ask = (
-        "Convert the answer to a JSON value valid under the supplied JSON schema. "
-        "Output only the JSON value, no fence or explanation.\n\n"
-        f"SCHEMA:\n{json.dumps(schema)}\n\n"
-        f"QUESTION:\n{question}\n\nANSWER:\n{_clip(answer, 15000)}"
-    )
-    payload = await _chat(
-        WRITER_MODELS,
-        [
-            {"role": "system", "content": "Return strictly valid JSON matching the schema."},
-            {"role": "user", "content": ask},
-        ],
-        deadline,
-        max_tokens=3000,
-        timeout_cap=SCHEMA_TIMEOUT,
-        temperature=0.0,
-    )
-    raw = _strip_fence(_llm_text(payload))
+async def _schema(question: str, answer: str, schema: Any, deadline: float) -> Any:
+    prompt = "Convert ANSWER to JSON matching SCHEMA. Output only JSON.\nSCHEMA:\n" + json.dumps(schema) + "\nQUESTION:\n" + question + "\nANSWER:\n" + answer[:14000]
+    text = await _chat([{"role": "user", "content": prompt}], deadline, 2600, SCHEMA_S, 0.0)
     try:
-        value = json.loads(raw)
+        return json.loads(re.sub(r"^```(?:json)?\s*|\s*```$", "", text.strip(), flags=re.I))
     except Exception:
-        return None
-    if _shape_ok(value, schema):
-        return value
-    if isinstance(value, dict) and len(value) == 1:
-        only = list(value.values())[0]
-        if _shape_ok(only, schema):
-            return only
-    return None
+        kind = _schema_kind(schema)
+        stripped = _CITE.sub("", answer).strip()
+        if kind == "array": return [x.strip(" -*") for x in stripped.splitlines() if x.strip()][:20]
+        if kind == "integer":
+            m = re.search(r"-?\d[\d,]*", stripped); return int(m.group(0).replace(',', '')) if m else 0
+        if kind == "number":
+            m = re.search(r"-?\d[\d,]*(?:\.\d+)?", stripped); return float(m.group(0).replace(',', '')) if m else 0.0
+        if kind == "boolean": return bool(re.search(r"\b(?:yes|true)\b", stripped, re.I))
+        if kind == "object": return {}
+        return stripped[:4000]
 
 
-def _coerce_schema(answer: str, schema: Any, depth: int = 0) -> Any:
-    if depth > 5:
-        return answer[:2000]
-    kind = _schema_kind(schema)
-    if kind == "string" or not kind:
-        return _clip(answer, 4000)
-    if kind == "integer":
-        m = re.search(r"-?\d[\d,]*", answer or "")
-        return int(m.group(0).replace(",", "")) if m else 0
-    if kind == "number":
-        m = re.search(r"-?\d[\d,]*(?:\.\d+)?", answer or "")
-        return float(m.group(0).replace(",", "")) if m else 0.0
-    if kind == "boolean":
-        return bool(re.search(r"\b(?:yes|true)\b", answer or "", re.I))
-    if kind == "array":
-        items = schema.get("items") if isinstance(schema, dict) else {}
-        lines = [x.strip(" -*•\t") for x in (answer or "").splitlines() if x.strip()]
-        if not lines:
-            lines = [answer.strip()] if answer.strip() else []
-        return [_coerce_schema(line, items, depth + 1) for line in lines[:20]]
-    if kind == "object":
-        props = schema.get("properties") if isinstance(schema, dict) else {}
-        if not isinstance(props, dict):
-            return {}
-        result: dict[str, Any] = {}
-        for key, sub in props.items():
-            if isinstance(key, str):
-                result[key] = _coerce_schema(answer, sub, depth + 1)
-        return result
-    if kind == "null":
-        return None
-    return _clip(answer, 4000)
-
-
-async def _solve(query: Query, question: str) -> Response:
-    deadline = monotonic() + WALL_SECONDS
+async def _solve(q: Query) -> Response:
+    question = (q.text or "").strip()
+    deadline = monotonic() + WALL_S
     await _load_models()
-
-    shape = QuestionShape(question)
-    vault = EvidenceVault(question)
-
-    try:
-        recent = await _preseed(question, shape, vault, deadline)
-    except Exception:
-        recent = ""
-
-    try:
-        provisional = await _research_loop(question, shape, vault, deadline, recent)
-    except Exception:
-        provisional = ""
-
-    answer = ""
-    if _left(deadline) > 10.0:
+    nb = Notebook(question)
+    await _gather(question, nb, deadline)
+    answer = await _chat(_answer_prompt(question, nb), deadline, 4300, CHAT_S, 0.03)
+    if not _usable(answer):
+        answer = nb.render(5000)
+    answer = await _repair(question, answer, nb, deadline)
+    answer = _clip(answer.strip(), ANSWER_CHARS)
+    refs = _citations(answer, nb)
+    if q.output_schema is not None:
+        value = await _schema(question, answer, q.output_schema, deadline)
         try:
-            answer = await _write_final(question, shape, vault, provisional, deadline)
+            return Response(output=value, citations=refs or None)
         except Exception:
-            answer = ""
-
-    if not _usable_answer(answer):
-        answer = provisional if _usable_answer(provisional) else _deterministic_partial(vault)
-
-    if _usable_answer(answer) and _left(deadline) > 28.0:
-        try:
-            answer = await _critic(question, shape, vault, answer, deadline)
-        except Exception:
-            pass
-
-    answer = _normalize_markers(answer).strip()
-    if len(answer) > ANSWER_CAP:
-        answer = answer[:ANSWER_CAP - 2] + " …"
-
+            return Response(output=value)
+    text = _bare(answer, question) or "Unable to produce a supported answer."
     try:
-        refs = _citations(answer, vault)
+        return Response(text=text, citations=refs or None)
     except Exception:
-        refs = []
-
-    shipped_text = _output_only_line(answer, question)
-    if not shipped_text:
-        shipped_text = _deterministic_partial(vault)
-    if not shipped_text:
-        shipped_text = "Unable to produce a supported answer."
-
-    if query.output_schema is not None:
-        structured = None
-        try:
-            structured = await _schema_convert(question, answer, query.output_schema, deadline)
-        except Exception:
-            structured = None
-        if structured is None:
-            structured = _coerce_schema(answer or shipped_text, query.output_schema)
-        try:
-            return Response(output=structured, citations=refs or None)
-        except Exception:
-            return Response(output=structured)
-
-    try:
-        return Response(text=shipped_text, citations=refs or None)
-    except Exception:
-        return Response(text=shipped_text)
+        return Response(text=text)
 
 
 @entrypoint("query")
 async def query(query: Query) -> Response:
-    question = (query.text or "").strip()
-    if not question:
+    if not (query.text or "").strip():
         return Response(text="No question provided.")
     try:
-        return await _solve(query, question)
+        return await _solve(query)
     except Exception:
-        # Never echo the prompt as the answer. This is only a final crash guard.
         return Response(text="Unable to produce a supported answer.")
