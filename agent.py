@@ -23,77 +23,9 @@ from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 VERSION = "atlas-quorum-v1.0"
 
-<<<<<<< HEAD
-VERSION = "orbit-evidence-v15.0-openrouter-deeploop"
-
-LLM_PROVIDER = "openrouter"
-LLM_FALLBACK_PROVIDER = "chutes"
-=======
->>>>>>> 614e52762c3cd192b8d381f36c8498278fecbd4c
 SEARCH_PROVIDER = "parallel"
 LLM_PROVIDERS = ("openrouter", "chutes")
 
-<<<<<<< HEAD
-WALL_SECONDS = 262.0
-WRAPUP_SECONDS = 86.0
-MIN_RETURN_SECONDS = 8.0
-MAX_RESEARCH_TURNS = 12
-MAX_ACTIONS_PER_TURN = 7
-
-SEARCH_TIMEOUT = 18.0
-FETCH_TIMEOUT = 16.0
-TOOL_PHASE_TIMEOUT = 28.0
-TURN_TIMEOUT = 60.0
-WRITER_TIMEOUT = 52.0
-CRITIC_TIMEOUT = 28.0
-SCHEMA_TIMEOUT = 36.0
-
-SEARCH_RESULTS = 10
-SEARCH_NOTE_SHOW = 720
-FETCH_WINDOW = 3400
-FETCH_WINDOWS = 3
-FETCH_ORIENTATION = 1200
-LOCAL_WINDOW = 1100
-LOCAL_HITS = 5
-LOCAL_READ_CAP = 12000
-
-DIGEST_CHARS = 82000
-ROW_DIGEST_CAP = 7200
-ANSWER_CAP = 52000
-MAX_CITATIONS = 22
-TOTAL_EVIDENCE_CAP = 110000
-CITATION_TARGET = 4800
-CITATION_ROW_CAP = 10500
-
-KEEP_MARGIN = 420
-MAX_KEPT_PER_ROW = 6
-MIN_QUOTE = 10
-
-PRIMARY_MODELS = (
-    "z-ai/glm-5.2",
-    "deepseek/deepseek-v3.2",
-    "openai/gpt-oss-120b",
-    "z-ai/glm-5",
-    "qwen/qwen3.6-30b-a3b-instruct",
-    "google/gemini-2.5-flash",
-    "deepseek-ai/DeepSeek-V3.2-TEE",
-    "Qwen/Qwen3.6-27B-TEE",
-)
-
-WRITER_MODELS = (
-    "openai/gpt-oss-120b",
-    "deepseek/deepseek-v3.2",
-    "z-ai/glm-5.2",
-    "google/gemini-2.5-flash",
-    "deepseek-ai/DeepSeek-V3.2-TEE",
-)
-
-_STATE: dict[str, Any] = {
-    "models": (),
-    "budget_left": None,
-    "models_by_provider": {},
-}
-=======
 WALL_S = 255.0
 TAIL_S = 9.0
 SEARCH_S = 18.0
@@ -124,7 +56,6 @@ PREFERRED_MODELS = (
 )
 
 STATE: dict[str, Any] = {"models": {}}
->>>>>>> 614e52762c3cd192b8d381f36c8498278fecbd4c
 
 _WORD = re.compile(r"[A-Za-z0-9][A-Za-z0-9'.-]{2,}")
 _STOP = set(
@@ -298,28 +229,6 @@ async def _load_models() -> None:
         providers = getattr(info, "response", {}).get("allowed_llm_provider_models", {})
         if not isinstance(providers, dict):
             return
-<<<<<<< HEAD
-        by_provider: dict[str, tuple[str, ...]] = {}
-        for provider in (LLM_PROVIDER, LLM_FALLBACK_PROVIDER):
-            raw = providers.get(provider)
-            names: list[str] = []
-            if isinstance(raw, (list, tuple)):
-                for item in raw:
-                    name = ""
-                    if isinstance(item, str):
-                        name = item.strip()
-                    elif isinstance(item, dict):
-                        candidate = item.get("model") or item.get("id") or item.get("name")
-                        if isinstance(candidate, str):
-                            name = candidate.strip()
-                    if name and name not in names:
-                        names.append(name)
-            if names:
-                by_provider[provider] = tuple(names)
-        if by_provider:
-            _STATE["models_by_provider"] = by_provider
-            _STATE["models"] = by_provider.get(LLM_PROVIDER) or next(iter(by_provider.values()))
-=======
         found: dict[str, tuple[str, ...]] = {}
         for provider in LLM_PROVIDERS:
             raw = providers.get(provider) or []
@@ -332,81 +241,10 @@ async def _load_models() -> None:
                 found[provider] = tuple(names)
         if found:
             STATE["models"] = found
->>>>>>> 614e52762c3cd192b8d381f36c8498278fecbd4c
     except Exception:
         return
 
 
-<<<<<<< HEAD
-def _model_order(preferred: tuple[str, ...], provider: str = LLM_PROVIDER) -> list[str]:
-    by_provider = _STATE.get("models_by_provider")
-    live = by_provider.get(provider) if isinstance(by_provider, dict) else None
-    if not live and provider == LLM_PROVIDER:
-        live = _STATE.get("models")
-    if isinstance(live, tuple) and live:
-        allowed = [x for x in live if isinstance(x, str) and x]
-        chosen = [x for x in preferred if x in allowed]
-        remainder = [x for x in allowed if x not in chosen]
-        # Prefer generally capable research/synthesis families over embedding-ish names.
-        def rank(name: str) -> tuple[int, str]:
-            low = name.lower()
-            if "glm-5.2" in low:
-                return (0, low)
-            if "gpt-oss-120b" in low:
-                return (1, low)
-            if "deepseek" in low and "v3.2" in low:
-                return (2, low)
-            if "glm-5" in low:
-                return (3, low)
-            if "qwen3.6" in low or "qwen3" in low:
-                return (4, low)
-            if "gemini-2.5" in low or "gemma-4-31b" in low:
-                return (5, low)
-            if "kimi" in low:
-                return (6, low)
-            return (9, low)
-        remainder.sort(key=rank)
-        return (chosen + remainder)[:5]
-    return list(preferred[:4])
-
-
-async def _chat(preferred: tuple[str, ...], messages: list[dict[str, Any]],
-                deadline: float, max_tokens: int, timeout_cap: float,
-                temperature: float = 0.1) -> Any:
-    attempts: list[tuple[str, str]] = []
-    for provider, prefs in (
-        (LLM_PROVIDER, preferred),
-        (LLM_FALLBACK_PROVIDER, PRIMARY_MODELS + WRITER_MODELS),
-    ):
-        for model in _model_order(prefs, provider):
-            pair = (provider, model)
-            if pair not in attempts:
-                attempts.append(pair)
-    for index, (provider, model) in enumerate(attempts[:8]):
-        remaining = _left(deadline)
-        if remaining <= MIN_RETURN_SECONDS + 4.0:
-            return None
-        cap = timeout_cap
-        if index == 1:
-            cap = min(cap, 24.0)
-        elif index >= 2:
-            cap = min(cap, 18.0)
-        timeout = min(cap, remaining - MIN_RETURN_SECONDS)
-        if timeout <= 5.0:
-            return None
-        try:
-            payload = await llm_chat(
-                provider=provider,
-                model=model,
-                messages=messages,
-                temperature=temperature,
-                max_output_tokens=max_tokens,
-                timeout=timeout,
-            )
-            _remember_budget(payload)
-            if _llm_text(payload):
-                return payload
-=======
 def _rank_model(name: str) -> tuple[int, str]:
     low = name.lower()
     if "glm-5.2" in low: return (0, low)
@@ -449,7 +287,6 @@ async def _chat(messages: list[dict[str, Any]], deadline: float, max_tokens: int
             text = _payload_text(payload)
             if text.strip():
                 return text.strip()
->>>>>>> 614e52762c3cd192b8d381f36c8498278fecbd4c
         except Exception:
             continue
     return ""
