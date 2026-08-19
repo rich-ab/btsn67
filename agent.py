@@ -28,7 +28,7 @@ from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
 
-VERSION = "orbit-evidence-v16.0-independent-source-first"
+VERSION = "orbit-evidence-v17.0-independent-audit-repair"
 
 LLM_PROVIDER = "openrouter"
 LLM_FALLBACK_PROVIDER = "chutes"
@@ -47,6 +47,7 @@ TURN_TIMEOUT = 60.0
 WRITER_TIMEOUT = 52.0
 CRITIC_TIMEOUT = 28.0
 SCHEMA_TIMEOUT = 36.0
+AUDIT_REPAIR_TIMEOUT = 24.0
 
 SEARCH_RESULTS = 10
 SEARCH_NOTE_SHOW = 720
@@ -64,6 +65,7 @@ MAX_CITATIONS = 22
 TOTAL_EVIDENCE_CAP = 110000
 CITATION_TARGET = 4800
 CITATION_ROW_CAP = 10500
+AUDIT_REPAIR_SEARCHES = 2
 
 KEEP_MARGIN = 420
 MAX_KEPT_PER_ROW = 6
@@ -1401,6 +1403,135 @@ async def _critic(question: str, shape: QuestionShape, vault: EvidenceVault,
     return candidate
 
 
+def _json_object(text: str) -> dict[str, Any] | None:
+    raw = _strip_fence(text)
+    try:
+        obj = json.loads(raw)
+        return obj if isinstance(obj, dict) else None
+    except Exception:
+        pass
+    start = raw.find("{")
+    end = raw.rfind("}")
+    if start >= 0 and end > start:
+        try:
+            obj = json.loads(raw[start:end + 1])
+            return obj if isinstance(obj, dict) else None
+        except Exception:
+            return None
+    return None
+
+
+async def _coverage_audit(question: str, shape: QuestionShape, vault: EvidenceVault,
+                          answer: str, deadline: float) -> dict[str, Any] | None:
+    if not _usable_answer(answer) or _left(deadline) < 55.0:
+        return None
+    digest = vault.digest(cap=30000)
+    prompt = (
+        "Audit this Harnyx answer for score-losing gaps. Return one JSON object "
+        "only with keys: verdict ('ok' or 'repair'), missing_parts (array of "
+        "unanswered requirements), source_scope_errors (array of claims not tied "
+        "to the source/date/scope required by the prompt), citation_errors "
+        "(array of important claims whose citation text may not support them), "
+        "needed_searches (array of at most 3 concise official-source search "
+        "queries that would close the gaps). Do not rewrite the answer.\n\n"
+        f"QUESTION:\n{question}\n\nSHAPE NOTES:\n{shape.hint()}\n\n"
+        f"ANSWER:\n{_clip(answer, 12000)}\n\nEVIDENCE:\n{digest}"
+    )
+    payload = await _chat(
+        WRITER_MODELS,
+        [
+            {"role": "system", "content": "You are a strict retrieval-gap auditor. JSON only."},
+            {"role": "user", "content": prompt},
+        ],
+        deadline,
+        max_tokens=1800,
+        timeout_cap=AUDIT_REPAIR_TIMEOUT,
+        temperature=0.0,
+    )
+    return _json_object(_llm_text(payload))
+
+
+def _audit_requires_repair(report: dict[str, Any] | None) -> bool:
+    if not isinstance(report, dict):
+        return False
+    if str(report.get("verdict") or "").lower().strip() == "ok":
+        return False
+    for key in ("missing_parts", "source_scope_errors", "citation_errors"):
+        vals = report.get(key)
+        if isinstance(vals, list) and any(str(v).strip() for v in vals):
+            return True
+    vals = report.get("needed_searches")
+    return isinstance(vals, list) and any(str(v).strip() for v in vals)
+
+
+async def _repair_from_audit(question: str, shape: QuestionShape, vault: EvidenceVault,
+                             answer: str, report: dict[str, Any],
+                             deadline: float) -> str:
+    searches: list[str] = []
+    raw = report.get("needed_searches") if isinstance(report, dict) else None
+    if isinstance(raw, list):
+        for item in raw:
+            q = _space(str(item))
+            if q and q.lower() not in [x.lower() for x in searches]:
+                searches.append(q)
+            if len(searches) >= AUDIT_REPAIR_SEARCHES:
+                break
+    if searches and _left(deadline) > 38.0:
+        tasks = [asyncio.ensure_future(_search_packet(q, advanced=True)) for q in searches]
+        await asyncio.wait(tasks, timeout=min(TOOL_PHASE_TIMEOUT, max(5.0, _left(deadline) - 12.0)))
+        for task in tasks:
+            if task.done():
+                try:
+                    vault.add_packet(task.result())
+                except Exception:
+                    pass
+            else:
+                task.cancel()
+        targets = _preseed_fetch_targets(vault, question, limit=1)
+        if targets and _left(deadline) > 24.0:
+            try:
+                packet = await asyncio.wait_for(
+                    _fetch_packet(targets[0], "audit repair: exact missing source/date/table/value", question),
+                    timeout=min(FETCH_TIMEOUT + 4.0, max(5.0, _left(deadline) - 10.0)),
+                )
+                vault.add_packet(packet)
+            except Exception:
+                pass
+    if _left(deadline) < 16.0:
+        return answer
+    gap_lines: list[str] = []
+    for key in ("missing_parts", "source_scope_errors", "citation_errors"):
+        vals = report.get(key)
+        if isinstance(vals, list):
+            gap_lines.extend(str(v) for v in vals if str(v).strip())
+    prompt = (
+        f"QUESTION:\n{question}\n\nCURRENT ANSWER:\n{_clip(answer, 10000)}\n\n"
+        "AUDIT GAPS TO FIX:\n- " + "\n- ".join(gap_lines[:8]) + "\n\n"
+        f"NUMBERED EVIDENCE, including any new repair searches:\n{vault.digest(cap=42000)}\n\n"
+        "Rewrite the final answer. Start with the answer, satisfy every source/date/"
+        "scope restriction literally, and cite every load-bearing claim with [n]."
+    )
+    payload = await _chat(
+        WRITER_MODELS,
+        [
+            {"role": "system", "content": COMMIT_RULES},
+            {"role": "user", "content": prompt},
+        ],
+        deadline,
+        max_tokens=4200,
+        timeout_cap=WRITER_TIMEOUT,
+        temperature=0.05,
+    )
+    candidate = _llm_text(payload)
+    if not _usable_answer(candidate):
+        return answer
+    if vault.rows and _has_citation(answer) and not _has_citation(candidate):
+        return answer
+    if len(candidate) < max(10, int(len(answer) * 0.35)):
+        return answer
+    return candidate
+
+
 def _deterministic_partial(vault: EvidenceVault) -> str:
     if not vault.rows:
         return ""
@@ -1575,6 +1706,14 @@ async def _solve(query: Query, question: str) -> Response:
     if _usable_answer(answer) and _left(deadline) > 28.0:
         try:
             answer = await _critic(question, shape, vault, answer, deadline)
+        except Exception:
+            pass
+
+    if _usable_answer(answer) and _left(deadline) > 55.0:
+        try:
+            report = await _coverage_audit(question, shape, vault, answer, deadline)
+            if _audit_requires_repair(report):
+                answer = await _repair_from_audit(question, shape, vault, answer, report or {}, deadline)
         except Exception:
             pass
 
