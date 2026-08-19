@@ -29,7 +29,7 @@ from harnyx_miner_sdk.api import fetch_page, llm_chat, search_web, tooling_info
 from harnyx_miner_sdk.decorators import entrypoint
 from harnyx_miner_sdk.query import CitationRef, CitationSlice, Query, Response
 
-VERSION = "v53-pool-authority-measure"
+VERSION = "v53-pool-slice"
 
 # ── providers / models ────────────────────────────────────────────────────────
 # v53o: SINGLE PROVIDER. The paid gateway lane is removed from this file entirely
@@ -122,29 +122,26 @@ LANE_B_MAX_PAYLOAD_CHARS = 400_000  # v53o: RAISED from 144k (~36k tok). That bo
 #   would now SKIP the last rung on exactly the long transcripts that need it.
 #   The guard itself is kept, retargeted at context overflow: ~100k tokens, under
 #   glm-5's window, so an over-long turn fails fast instead of paying for a 400.
+AUDIT_TIMEOUT_S = 28.0
 SEARCH_TIMEOUT_S = 18.0
 FETCH_TIMEOUT_S = 16.0
-AUDIT_TIMEOUT_S = 28.0
 WRAPUP_AT_S = 90.0           # remaining <= this -> stop researching, write. v32.6 tried 105 to dodge the
 #   two wall-hit zeros: it worked (0/30 tasks past 240s) but cost EVERY task 15s
 #   of research and all three smoke batches fell (7.5->5.0, 5.0->4.5, 7.0->5.0).
 #   Reverted: 90 is the prod-validated value (0.650, rank 21/265), and
 #   _informative_lead now degrades a wall hit gracefully instead of shipping
 #   page furniture, so the rare case no longer needs a fleet-wide tax.
-RESCUE_TIMEOUT_S = 55.0
-DIGEST_TAIL_S = 14.0     # reserved for _knowledge_resort / _schema_output (both need 12s)
-MIN_TAIL_S = 8.0
-MAX_TURNS = 15          # v32.4: field runs 14-16; 13 was the most turn-starved in the class
 AUDIT_EXTRA_TURNS = 2
-ANSWER_REPAIR_TURNS = 2      # v32.4: bounded retries when the model emits junk instead of an answer
-
-# ── payload shaping ───────────────────────────────────────────────────────────
-_LEDGER_TEXT_CAP = 400_000   # in-process only; never shipped, so it costs nothing
-PAGE_GREP_WINDOW = 700
+MIN_TAIL_S = 8.0
+MAX_TURNS = 15          
+DIGEST_TAIL_S = 14.0    
+ANSWER_REPAIR_TURNS = 2     
+RESCUE_TIMEOUT_S = 55.0
 SEARCH_EXCERPT_CHARS = 550
+_LEDGER_TEXT_CAP = 400_000   
+PAGE_GREP_WINDOW = 700
 PAGE_GREP_MAX_HITS = 6
 PAGE_READ_MAX_CHARS = 12_000
-
 # ── quote-first evidence (FRONT / Grounding-Guided-Generation pattern) ───────
 # Our citations have been POST-HOC: we cite whichever window we happened to show
 # the model, so nothing guarantees the cited span contains the text that proved
@@ -1630,9 +1627,6 @@ async def _knowledge_brief(question: str) -> tuple[str, str]:
 # producing a draft of candidates + near-misses, injected as its OWN system
 # block. Fires only on questions the set/superlative detectors already flag,
 # with time and spend floors, and any failure means the block is simply absent.
-#
-# It is the only stage that acts BEFORE the answer exists, so it never competes
-# with the two post-audit sweeps for the tail.
 POOL_DRAFT_TIMEOUT_S = 22.0
 POOL_DRAFT_MIN_LEFT_S = 150.0
 MAX_POOL_DRAFT_LINES = 25
@@ -1922,12 +1916,26 @@ async def _audit_patch(question: str, answer: str, messages: list[dict],
 
 
 # ── shared sweep helpers ─────────────────────────────────────────────────────
-def _salient_terms(question: str, limit: int) -> list[str]:
-    """Content tokens of the question, shared by every sweep's query builder."""
+def _salient_terms(question: str, limit: int, drop: str = "") -> list[str]:
+    """Content tokens of the question, shared by the sweeps' query builders.
+    `drop` removes one token (e.g. the year already appended to the query)."""
     picked = [t for t in _SEED_TOKEN_RE.findall(" ".join((question or "").split()))
               if (len(t) >= 3 or t.isdigit())
-              and t.lower() not in _STOP and t.lower() not in _SEED_STOP]
+              and t.lower() not in _STOP and t.lower() not in _SEED_STOP
+              and (not drop or t != drop)]
     return picked[:limit]
+
+
+def _cited_row_text(answer: str, ledger: EvidenceLedger) -> list[str]:
+    """Stored text of every row the answer actually cites, [] when uncited."""
+    cited = _cited_numbers(answer, len(ledger.rows))
+    if not cited:
+        return []                          # nothing cited: the floor's problem
+    stored = []
+    for n in cited:
+        row = ledger.rows[n - 1]
+        stored.append((row.get("text") or "") + " " + (row.get("preview") or ""))
+    return stored
 
 
 def _adopt_patch(previous: str, candidate: str) -> str:
@@ -1941,50 +1949,130 @@ def _adopt_patch(previous: str, candidate: str) -> str:
     return candidate
 
 
-# ── stage 3p: primary-source anchoring ───────────────────────────────────────
-# When the question names an official source class (census, SEC filing, a
-# ministry, "official statistics") the judge favors the answer whose citations
-# come from that source rather than an aggregator. Deterministic gate: the
-# question must signal officialness AND no cited row may already be from an
-# authoritative host; then ONE targeted search for the official page plus a
-# bounded rewrite round. The host regex is unit-tested against real URLs — an
-# earlier generation shipped a raw-string \\.gov that never matched.
-#
-# NOTE for future merges: this stage skips whenever ANY cited row already sits on
-# an authoritative host. If a corroboration sweep is ever added to this build it
-# must run AFTER this one — a .gov result pulled in by corroboration would make
-# this stage skip while the load-bearing claims stayed on the aggregator.
-_PRIMARY_CUE_RE = re.compile(
-    r"\bofficial\b|\bcensus\b|\bSEC\b|\b10-[KQ]\b|\bfiling\b|"
-    r"\bgovernment\b|\bfederal\b|\bministry\b|\bbureau\b|"
-    r"\bstatistics (?:office|bureau|agency)\b|\baccording to the "
-    r"(?:UN|EU|IMF|OECD|WHO|World Bank)\b", re.IGNORECASE)
-_PRIMARY_HOST_RE = re.compile(
-    r"\.gov(?:\.[a-z]{2})?(?:/|$)|\.edu(?:/|$)|\.mil(?:/|$)|"
-    r"europa\.eu|un\.org|who\.int|oecd\.org|imf\.org|worldbank\.org|"
-    r"sec\.gov|census\.gov|ecb\.europa\.eu", re.IGNORECASE)
-PRIMARY_ANCHOR_MIN_LEFT_S = 85.0
+# ── numeric scanning, shared by stage 3s and the citation post-pass ──────────
+# Both donor builds defined this pattern twice under different names with
+# byte-identical bodies. One constant here, used by every numeric consumer.
+_MARKER_STRIP_RE = re.compile(r"\[[0-9][0-9,\s\-]*\]")
+_NUMERIC_TOKEN_RE = re.compile(r"\$?\b\d[\d,]*(?:\.\d+)?%?")
 
 
-def _referenced_hosts(answer: str, ledger: EvidenceLedger) -> list[str]:
-    hosts = []
+# ── stage 3t: timeframe-alignment repair ─────────────────────────────────────
+# A question pinned to an explicit year ("as of 2021", "in FY2019") loses
+# SILENTLY when the rows the answer cites describe a different year: the judge
+# reads the cited slice, sees 2019 where the question demands 2021, and scores
+# the claim wrong even though the entity is right. Deterministic backstop: pull
+# the question's explicit year anchors; if NO cited row's text mentions one of
+# them, spend one aimed search pinned to that year plus a bounded rewrite round.
+# Fires narrowly (questions with literal years only), inherits the audit's
+# regression guards, and any failure returns the answer untouched.
+_ANCHOR_YEAR_RE = re.compile(r"\b(19[0-9]{2}|20[0-2][0-9])\b")
+MAX_ANCHOR_YEARS = 3
+TIMEFRAME_MIN_LEFT_S = 90.0
+
+
+def _anchor_years(question: str) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for y in _ANCHOR_YEAR_RE.findall(question or ""):
+        if y not in seen:
+            seen.add(y)
+            out.append(y)
+    return out[:MAX_ANCHOR_YEARS]
+
+
+def _unevidenced_years(question: str, answer: str, ledger: EvidenceLedger) -> list[str]:
+    years = _anchor_years(question)
+    if not years:
+        return []
+    stored = _cited_row_text(answer, ledger)
+    if not stored:
+        return []
+    return [y for y in years if not any(y in t for t in stored)]
+
+
+def _year_probe_query(question: str, year: str) -> str:
+    return " ".join(_salient_terms(question, 7, drop=year)) + f" {year}"
+
+
+async def _align_timeframe(question: str, answer: str, messages: list[dict],
+                           ledger: EvidenceLedger, deadline: float) -> str:
+    if (deadline - monotonic()) < TIMEFRAME_MIN_LEFT_S or _spend_left() <= AUDIT_MIN_USD:
+        return answer
+    uncovered = _unevidenced_years(question, answer, ledger)
+    if not uncovered:
+        return answer
+    year = uncovered[0]
+    try:
+        found = await asyncio.wait_for(_do_search(_year_probe_query(question, year), ledger),
+                                       timeout=SEARCH_TIMEOUT_S * 2 + 6.0)
+        body = _commit_tool_output(found, ledger)
+    except Exception:
+        body = ""
+    order = (f"TEMPORAL AUDIT: the question is pinned to {year}, but NO evidence "
+             "row the answer cites mentions that year — the cited values may "
+             "describe a different period, which scores as wrong. ")
+    if body and _CITE_MARK_RE.search(body):
+        order += (f"One more search pinned to {year} is already numbered below — "
+                  "verify every dated value against it, fix any that describe a "
+                  "different period, and rewrite the COMPLETE final answer with "
+                  "[n] citations.\n\n" + body)
+    else:
+        order += (f"Use at most 2 tool calls to verify the {year} values, then "
+                  "rewrite the COMPLETE final answer with [n] citations.")
+    messages.append({"role": "system", "content": order})
+    patched, _ = await _loop(question, "", ledger, deadline, 3,
+                             carry=messages, allow_tools_in_wrapup=True)
+    return _adopt_patch(answer, patched)
+
+
+# ── stage 3s: second-source check on the decisive figure ─────────────────────
+# Judges reward answers whose decisive figure is confirmed by more than one
+# independent source, and a single-source figure is where our wrong answers
+# hide. Deterministic: find the HEADLINE value (first number in the answer line),
+# count DISTINCT cited URLs whose stored text contains it; if exactly one, spend
+# ONE corroborating search. Runs after timeframe alignment, which can replace
+# the decisive figure wholesale.
+SECOND_SOURCE_MIN_LEFT_S = 80.0
+
+
+def _headline_value(answer: str) -> str:
+    body = _MARKER_STRIP_RE.sub(" ", answer or "")
+    for line in body.split("\n"):
+        line = line.strip()
+        if not line:
+            continue
+        for m in _NUMERIC_TOKEN_RE.finditer(line):
+            v = m.group(0).strip("$%")
+            if len(re.sub(r"\D", "", v)) >= 3:      # 3+ digits: a real figure
+                return v
+        break                                        # only the lead line
+    return ""
+
+
+def _value_backers(figure: str, answer: str, ledger: EvidenceLedger) -> set[str]:
+    if not figure:
+        return set()
+    plain = figure.replace(",", "")
+    hosts = set()
     for n in _cited_numbers(answer, len(ledger.rows)):
-        u = ledger.rows[n - 1].get("url") or ""
-        if u:
-            hosts.append(u)
+        row = ledger.rows[n - 1]
+        stored = row.get("text") or ""
+        if figure in stored or (plain != figure and plain in stored):
+            hosts.add(row.get("url") or f"row{n}")
     return hosts
 
 
-async def _anchor_primary_source(question: str, answer: str, messages: list[dict],
-                                 ledger: EvidenceLedger, deadline: float) -> str:
-    if (deadline - monotonic()) < PRIMARY_ANCHOR_MIN_LEFT_S or _spend_left() <= AUDIT_MIN_USD:
+async def _second_source_check(question: str, answer: str, messages: list[dict],
+                               ledger: EvidenceLedger, deadline: float) -> str:
+    if (deadline - monotonic()) < SECOND_SOURCE_MIN_LEFT_S or _spend_left() <= AUDIT_MIN_USD:
         return answer
-    if not _PRIMARY_CUE_RE.search(question or ""):
+    figure = _headline_value(answer)
+    if not figure:
         return answer
-    hosts = _referenced_hosts(answer, ledger)
-    if not hosts or any(_PRIMARY_HOST_RE.search(u) for u in hosts):
-        return answer                # already anchored to an official source
-    query = " ".join(_salient_terms(question, 7)) + " official source"
+    backers = _value_backers(figure, answer, ledger)
+    if len(backers) != 1:
+        return answer                 # 0 = nothing to confirm; 2+ = corroborated
+    query = " ".join(_salient_terms(question, 6)) + " " + figure
     try:
         found = await asyncio.wait_for(_do_search(query, ledger),
                                        timeout=SEARCH_TIMEOUT_S * 2 + 6.0)
@@ -1993,77 +2081,15 @@ async def _anchor_primary_source(question: str, answer: str, messages: list[dict
         return answer
     if not (body and _CITE_MARK_RE.search(body)):
         return answer
-    order = ("AUTHORITY SWEEP: the question points at an official source but "
-             "every citation is an aggregator. One search aimed at the official "
-             "page is numbered below — if it confirms the figures, re-anchor "
-             "the load-bearing claims to it (keep the old [n] where they add "
-             "coverage); if it disagrees, the official source wins. Then "
-             "rewrite the COMPLETE final answer with [n] citations.\n\n" + body)
+    order = (f"CORROBORATION: the answer's decisive figure {figure} rests on a "
+             "single source. One search for independent confirmation is "
+             "numbered below. If a second source states the same figure, cite "
+             "it alongside the first; if sources DISAGREE, re-verify which is "
+             "right before answering. Then rewrite the COMPLETE final answer "
+             "with [n] citations.\n\n" + body)
     messages.append({"role": "system", "content": order})
     patched, _ = await _loop(question, "", ledger, deadline, 3,
                              carry=messages, allow_tools_in_wrapup=True)
-    return _adopt_patch(answer, patched)
-
-
-# ── stage 3m: measure/scale conformance ──────────────────────────────────────
-# A silent judge loss: the question demands "in millions of USD" or "in km" and
-# the answer ships a raw number, the wrong currency symbol, or the wrong scale
-# word. Detection is deterministic — extract the unit/currency/scale the QUESTION
-# demands, check the answer's figure-bearing lines carry it — and only on a
-# mismatch spend one bounded rewrite round. No tool calls; zero cost when clean.
-# RUNS LAST BY DESIGN: the authority sweep above rewrites the whole answer, so a
-# measure annotation applied before it would be discarded by that rewrite. BOTH
-# donor builds shipped the opposite order — uid 111 and uid 236 each put this
-# stage at 70s ahead of a 75s sweep — which silently threw away every annotation
-# it produced whenever that sweep fired.
-_MEASURE_ASK_RE = re.compile(
-    r"\bin (millions?|billions?|thousands?)(?: of)? (USD|EUR|GBP|dollars|euros|"
-    r"pounds)\b|\bin (USD|EUR|GBP|km|kilometers|miles|meters|feet|hectares|"
-    r"acres|tonnes|tons|kg|kilograms|pounds|percent|%)\b", re.IGNORECASE)
-_MEASURE_GLYPH = {"usd": "$", "dollars": "$", "eur": "€", "euros": "€",
-                  "gbp": "£", "pounds": "£"}
-MEASURE_FIX_MIN_LEFT_S = 70.0
-
-
-def _required_measure(question: str) -> str:
-    m = _MEASURE_ASK_RE.search(question or "")
-    if not m:
-        return ""
-    return " ".join(g.lower() for g in m.groups() if g)
-
-
-def _measure_present(answer: str, demand: str) -> bool:
-    if not demand:
-        return True
-    lowered = (answer or "").lower()
-    tokens = demand.split()
-    hits = 0
-    for t in tokens:
-        glyph = _MEASURE_GLYPH.get(t)
-        # stem match: a "millions" demand is satisfied by "394 million"
-        if t.rstrip("s") in lowered or (glyph and glyph in (answer or "")):
-            hits += 1
-    return hits >= len(tokens)
-
-
-async def _conform_measures(question: str, answer: str, messages: list[dict],
-                            ledger: EvidenceLedger, deadline: float) -> str:
-    if (deadline - monotonic()) < MEASURE_FIX_MIN_LEFT_S or _spend_left() <= AUDIT_MIN_USD:
-        return answer
-    demand = _required_measure(question)
-    if not demand or _measure_present(answer, demand):
-        return answer
-    if not re.search(r"\d", answer or ""):
-        return answer                 # no figures to re-unit
-    order = (f"UNIT CHECK: the question demands figures in '{demand}' but the "
-             "answer's numbers do not carry that unit/currency/scale. Convert "
-             "or annotate EVERY load-bearing figure to the demanded unit "
-             "(keep the source's verbatim value alongside if it differs), do "
-             "not change any underlying value, then rewrite the COMPLETE final "
-             "answer with [n] citations.")
-    messages.append({"role": "system", "content": order})
-    patched, _ = await _loop(question, "", ledger, deadline, 2,
-                             carry=messages, allow_tools_in_wrapup=False)
     return _adopt_patch(answer, patched)
 
 
@@ -2225,7 +2251,40 @@ def _verbatim_structured(obj, ledger: EvidenceLedger, depth: int = 0):
     return obj
 
 
-def _citations_for(answer: str, ledger: EvidenceLedger) -> list[CitationRef]:
+# ── citation post-pass: URL dedupe + value-anchored slice backfill ────────────
+# Two defects the judge rubric punishes directly, both fixable after the fact
+# with zero LLM calls and zero latency:
+#   1. The same page surfaced by two searches yields two near-identical refs —
+#      judge rule 12 counts repetitive citations AGAINST answer quality. Keep
+#      the ref with the widest materialized coverage per URL.
+#   2. An answer-visible figure can sit in a cited row's stored text but OUTSIDE
+#      the materialized slices — the judge reads only the slices, so the claim
+#      dangles. Append a small slice around the figure's first occurrence,
+#      budget-checked against the same 120k evidence wall.
+# The wrapped builder falls back to the base result on ANY exception or empty
+# output, so this pass can never cost a run its evidence.
+BACKFILL_MARGIN_CHARS = 300   # context kept either side of a backfilled figure
+MAX_BACKFILL_FIGURES = 12
+
+
+def _answer_figures(answer: str) -> list[str]:
+    """Salient numeric values in the answer, [n] markers stripped, capped."""
+    body = _MARKER_STRIP_RE.sub(" ", answer or "")
+    out: list[str] = []
+    seen: set[str] = set()
+    for m in _NUMERIC_TOKEN_RE.finditer(body):
+        v = m.group(0).strip("$%")
+        if len(re.sub(r"\D", "", v)) < 2:
+            continue
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
+        if len(out) >= MAX_BACKFILL_FIGURES:
+            break
+    return out
+
+
+def _refs_within_budget(answer: str, ledger: EvidenceLedger) -> list[CitationRef]:
     """Build refs under the platform's materialized-evidence wall.
 
     harnyx_commons/application/miner_response_hydration.py: the validator
@@ -2255,6 +2314,84 @@ def _citations_for(answer: str, ledger: EvidenceLedger) -> list[CitationRef]:
         spent += cost
         refs.append(ref)
     return refs
+
+
+def _citations_for(answer: str, ledger: EvidenceLedger) -> list[CitationRef]:
+    try:
+        base = _refs_within_budget(answer, ledger)
+        if not base:
+            return base
+        # map each ref back to its ledger row (receipt_id+result_id is unique
+        # per row by construction — rows are appended once per tool result)
+        row_of: dict = {}
+        for row in ledger.rows:
+            row_of[(row["receipt_id"], row["result_id"])] = row
+        keyed = []
+        for ref in base:
+            row = row_of.get((ref.receipt_id, ref.result_id))
+            if row is None:
+                return base            # unexpected shape — hands off
+            keyed.append((ref, row))
+        # 1) URL dedupe: keep the widest-coverage ref per non-empty URL
+        best: dict = {}
+        deduped = []
+        for ref, row in keyed:
+            url = row.get("url") or ""
+            width = sum(max(0, s.end - s.start) for s in (ref.slices or []))
+            if not url:
+                deduped.append([ref, row, width])
+                continue
+            if url in best:
+                if width > best[url][2]:
+                    best[url][0], best[url][2] = ref, width
+                continue
+            entry = [ref, row, width]
+            best[url] = entry
+            deduped.append(entry)
+        # 2) value backfill onto the deduped set
+        spent = sum(e[2] for e in deduped)
+        for value in _answer_figures(answer):
+            plain = value.replace(",", "")
+            covered = False
+            for ref, row, _w in deduped:
+                text = row.get("text") or ""
+                for s in (ref.slices or []):
+                    seg = text[s.start:s.end]
+                    if value in seg or (plain != value and plain in seg):
+                        covered = True
+                        break
+                if covered:
+                    break
+            if covered:
+                continue
+            for entry in deduped:
+                ref, row, width = entry
+                text = row.get("text") or ""
+                idx = text.find(value)
+                if idx < 0 and plain != value:
+                    idx = text.find(plain)
+                if idx < 0:
+                    continue
+                note_len = int(row.get("note_len") or 0) or len(text)
+                start = max(0, idx - BACKFILL_MARGIN_CHARS)
+                end = min(note_len, idx + len(value) + BACKFILL_MARGIN_CHARS)
+                cost = end - start
+                if cost <= 0 or spent + cost > EVIDENCE_CHAR_BUDGET:
+                    continue
+                entry[0] = CitationRef(
+                    receipt_id=ref.receipt_id, result_id=ref.result_id,
+                    slices=list(ref.slices or []) + [CitationSlice(start=start,
+                                                                   end=end)])
+                entry[2] = width + cost
+                spent += cost
+                break
+        out = [e[0] for e in deduped]
+        return out if out else base
+    except Exception:
+        try:
+            return _refs_within_budget(answer, ledger)
+        except Exception:
+            return []
 
 
 # ── fallbacks / output ────────────────────────────────────────────────────────
@@ -2923,15 +3060,15 @@ async def _solve(query: Query, question: str) -> Response:
         pass
 
     # ── post-audit sweep chain ────────────────────────────────────────────────
-    # Source anchoring first, measure conformance last: the anchoring sweep
-    # rewrites the WHOLE answer, so a unit annotation applied before it would be
-    # discarded. Each stage re-checks its own time/spend floor and returns
-    # `answer` untouched on any failure.
-    for _sweep in (_anchor_primary_source, _conform_measures):
+    # PERIOD first: a wrong period invalidates the decisive figure the next stage
+    # inspects, and its repair can replace that figure wholesale. Each stage
+    # re-checks its own time/spend floor and returns `answer` untouched on any
+    # failure. The citation post-pass runs later, in _citations_for.
+    for _sweep in (_align_timeframe, _second_source_check):
         try:
             if not _is_usable_answer(answer):
                 break
-            if (deadline - monotonic()) <= MEASURE_FIX_MIN_LEFT_S:
+            if (deadline - monotonic()) <= SECOND_SOURCE_MIN_LEFT_S:
                 break
             if _spend_left() <= AUDIT_MIN_USD:
                 break
@@ -3041,8 +3178,8 @@ async def _solve(query: Query, question: str) -> Response:
     except Exception:
         return Response(text=text)
 
-# slot: harnyx 2026-08-15T13:09:39+00:00
+# slot: harnyx 2026-08-17T12:49:36+00:00
 
 # perfect_suffix: openrouter/parallel
-_PERFECT_SUFFIX = "0067680d9f35e0de"
+_PERFECT_SUFFIX = "b245a21b9f151e52"
 
